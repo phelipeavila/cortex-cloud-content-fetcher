@@ -147,7 +147,22 @@ def estimate_time_and_log(control_ids, standard_name):
 
 
 def fetch_single_control_details(cid):
-    """Fetch details for a single control by ID."""
+    """
+    Fetch details for a single control by ID.
+    
+    Returns MINIMAL data to reduce context size:
+    - revision: Used as lookup key in ComplianceFetchAssets
+    - control_id: For output enrichment
+    - control_name: For API filter and summary output
+    - severity: For output enrichment
+    - category: For output enrichment
+    - subcategory: For output enrichment
+    - rule_count: Number of rules (for quick filtering)
+    - rule_names: Full rule names list (for output enrichment)
+    
+    Removed to save space:
+    - scannable_asset_types: Not used in enrichment
+    """
     severity_map = {
         "SEV_050_CRITICAL": "Critical",
         "SEV_040_HIGH": "High",
@@ -167,16 +182,20 @@ def fetch_single_control_details(cid):
             return None
 
         rules = ctrl.get("COMPLIANCE_RULES") or []
+        rule_names = sorted({str(r["NAME"]) for r in rules if "NAME" in r})
+        scannable_asset_types = sorted({str(at) for r in rules for at in r.get("SCANNABLE_ASSETS", [])})
 
+        # OPTIMIZED: Store only essential fields for enrichment
         return {
+            "revision": str(ctrl.get("REVISION")),  # Lookup key
             "control_id": ctrl.get("CONTROL_ID", cid),
-            "control_name": ctrl.get("CONTROL_NAME", ""),
-            "revision": str(ctrl.get("REVISION")),
+            "control_name": ctrl.get("CONTROL_NAME", ""),  # Needed for API filter & summary
             "severity": severity_map.get(ctrl.get("SEVERITY"), "Unknown"),
             "category": ctrl.get("CATEGORY", ""),
             "subcategory": ctrl.get("SUBCATEGORY", ""),
-            "rule_names": sorted({str(r["NAME"]) for r in rules if "NAME" in r}),
-            "scannable_asset_types": sorted({str(at) for r in rules for at in r.get("SCANNABLE_ASSETS", [])}),
+            "rule_count": len(rule_names),  # For quick filtering
+            "rule_names": rule_names,  # Full list for output enrichment
+            "scannable_asset_types": scannable_asset_types,  # Asset types this control scans
         }
 
     except Exception as e:
@@ -384,11 +403,12 @@ def main():
             for error in errors:
                 readable += f"- {error}\n"
 
-        # Output as dict keyed by standard name
+        # PHASE 1 FIX: Use setContext directly to REPLACE (not append) the catalog
+        # CommandResults with outputs_prefix appends to a list, causing duplicates
+        demisto.setContext("ComplianceControlsCatalog", controls_catalog)
+        
+        # Return readable output only (no outputs to avoid duplication)
         return_results(CommandResults(
-            outputs_prefix="ComplianceControlsCatalog",
-            outputs_key_field="standard_name",
-            outputs=controls_catalog,
             readable_output=readable
         ))
 

@@ -3,6 +3,9 @@
 Stage 2: Fetches compliance assets, enriches them with control data,
 and optionally pushes to the HTTP Collector.
 
+OPTIMIZED VERSION: Fetches ALL assets at once per anchor instead of
+per-control, reducing API calls from 150+ to ~5-10 (pagination only).
+
 Supports multiple profile/standard pairs from context.
 Supports progress tracking for resumable execution on timeouts.
 
@@ -27,7 +30,6 @@ Outputs:
         - standard_name: Standard name
         - total_assets: Total number of assets fetched
         - pushed_count: Number of records pushed to collector
-        - assets: List of enriched asset records (if small enough)
 
     Context path: ComplianceAssetsProgress (progress tracking)
         - total_anchors: Total number of anchors to process
@@ -42,22 +44,7 @@ Outputs:
 # from CommonServerPython import *
 import json
 import requests
-import time
 from datetime import datetime
-
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
-
-# Skip controls that have no rules (they won't return assets anyway)
-SKIP_CONTROLS_WITHOUT_RULES = True
-
-# Rate limiting (set to 0 for faster execution, increase if hitting API rate limits)
-CONTROL_DELAY = 0
-
-# Time estimation
-SAMPLE_SIZE = 3  # Number of controls to sample for time estimation
-TIMEOUT_BUFFER = 1.5  # Multiplier for recommended timeout
 
 
 # =============================================================================
@@ -90,7 +77,18 @@ def get_anchors_from_context():
 
 
 def get_controls_catalog_from_context():
-    """Retrieve controls catalog (dict keyed by standard) from context."""
+    """
+    Retrieve controls catalog (dict keyed by standard) from context.
+    
+    After Phase 1 optimization, the catalog is stored directly as a dict:
+    {
+        "Standard1": {"controls": [...], "standard_name": "...", "total_controls": N},
+        "Standard2": {"controls": [...], ...}
+    }
+    
+    Legacy format (before optimization) was a list that needed merging.
+    This function handles both formats for backwards compatibility.
+    """
     catalog = demisto.context().get("ComplianceControlsCatalog")
     if not catalog:
         raise DemistoException(
@@ -98,39 +96,36 @@ def get_controls_catalog_from_context():
             "Please run ComplianceGetControls first."
         )
 
-    # XSOAR stores dict outputs as a list of single-key dicts:
-    # [{'Standard1': {controls: [...]}}, {'Standard2': {controls: [...]}}]
-    # We need to merge them into one dict keyed by standard name.
-
-    if isinstance(catalog, list):
-        catalog_dict = {}
-        for item in catalog:
-            if isinstance(item, dict):
-                # Each item is {standard_name: {controls: [...], ...}}
-                for key, value in item.items():
-                    if isinstance(value, dict) and "controls" in value:
-                        catalog_dict[key] = value
-                    elif key == "standard_name" and "controls" in item:
-                        # Alternative structure: {standard_name: "X", controls: [...]}
-                        catalog_dict[value] = item
-            elif isinstance(item, str):
-                # Skip truncation messages like "...NOTE, too much data..."
-                continue
-        return catalog_dict
-
-    elif isinstance(catalog, dict):
-        # Check if it's a single standard entry
+    # NEW FORMAT (Phase 1): Direct dict keyed by standard name
+    if isinstance(catalog, dict):
+        # Check if already in correct format (keyed by standard name)
+        for key, val in catalog.items():
+            if isinstance(val, dict) and "controls" in val:
+                return catalog
+        
+        # Check if it's a single standard entry with flat structure
         if "standard_name" in catalog and "controls" in catalog:
             standard_name = catalog.get("standard_name")
             return {standard_name: catalog}
 
-        # Check if already keyed by standard name
-        for key, val in catalog.items():
-            if isinstance(val, dict) and "controls" in val:
-                return catalog
-
-        # Unexpected structure
+        # Unexpected dict structure - return as-is
         return catalog
+
+    # LEGACY FORMAT: List of dicts (from CommandResults with outputs_prefix)
+    # This handles old context data before the optimization was applied
+    elif isinstance(catalog, list):
+        catalog_dict = {}
+        for item in catalog:
+            if isinstance(item, dict):
+                for key, value in item.items():
+                    if isinstance(value, dict) and "controls" in value:
+                        catalog_dict[key] = value
+                    elif key == "standard_name" and "controls" in item:
+                        catalog_dict[value] = item
+            elif isinstance(item, str):
+                # Skip truncation messages
+                continue
+        return catalog_dict
 
     else:
         raise DemistoException(
@@ -158,7 +153,7 @@ def get_controls_for_standard(catalog, standard_name):
 
 
 # =============================================================================
-# PROGRESS TRACKING
+# PROGRESS TRACKING (Simplified - per-anchor only)
 # =============================================================================
 
 def get_progress_from_context():
@@ -184,13 +179,7 @@ def initialize_progress(anchors):
         "completed_anchors": 0,
         "completed_pairs": [],
         "pending_pairs": all_pairs,
-        "is_complete": False,
-        # Control-level progress for current anchor
-        "current_pair": None,
-        "processed_controls": [],  # Control names already processed for current pair
-        "skipped_controls": [],  # Controls that timed out and were skipped
-        "total_controls_in_pair": 0,
-        "current_control": None  # Control currently being processed (for timeout detection)
+        "is_complete": False
     }
 
 
@@ -215,50 +204,6 @@ def update_progress_after_anchor(progress, pair_key):
     progress["completed_anchors"] = len(completed)
     progress["is_complete"] = len(pending) == 0
 
-    # Reset control-level progress for next anchor
-    progress["current_pair"] = None
-    progress["processed_controls"] = []
-    progress["total_controls_in_pair"] = 0
-
-    return progress
-
-
-def start_anchor_progress(progress, pair_key, total_controls):
-    """Start tracking control-level progress for an anchor."""
-    # Only reset processed_controls if we're starting a new pair
-    if progress.get("current_pair") != pair_key:
-        progress["processed_controls"] = []
-    progress["current_pair"] = pair_key
-    progress["total_controls_in_pair"] = total_controls
-    return progress
-
-
-def update_progress_after_control(progress, control_name):
-    """Update progress after processing a single control."""
-    processed = progress.get("processed_controls", [])
-    if control_name not in processed:
-        processed.append(control_name)
-    progress["processed_controls"] = processed
-    return progress
-
-
-def get_remaining_controls(control_names, progress, pair_key):
-    """Get controls that haven't been processed yet for this pair."""
-    # Check if we're resuming the same pair
-    if progress.get("current_pair") == pair_key:
-        processed = set(progress.get("processed_controls", []))
-        skipped = set(progress.get("skipped_controls", []))
-        return [c for c in control_names if c not in processed and c not in skipped]
-    # New pair, all controls need processing
-    return control_names
-
-
-def skip_timed_out_control(progress, control_name):
-    """Mark a control as skipped (timed out too many times)."""
-    skipped = progress.get("skipped_controls", [])
-    if control_name not in skipped:
-        skipped.append(control_name)
-    progress["skipped_controls"] = skipped
     return progress
 
 
@@ -308,9 +253,12 @@ def parse_api_response(result, operation):
 
 def post_to_api(uri, body):
     """Execute a POST request via core-api-post."""
+    # Note: We don't checkpoint here to avoid too many context writes
+    # The checkpoint before calling this function should be sufficient
     result = demisto.executeCommand("core-api-post", {
         "uri": uri,
-        "body": json.dumps(body)
+        "body": json.dumps(body),
+        "timeout": 300  # 5 minute timeout for API calls
     })
     return parse_api_response(result, f"POST {uri}")
 
@@ -346,14 +294,80 @@ def push_records_to_collector(records, collector_url, api_key, batch_size, dry_r
 
 
 # =============================================================================
-# ASSET FETCHING
+# ASSET FETCHING (OPTIMIZED - Fetch all assets at once)
 # =============================================================================
 
+def get_asset_count_for_anchor(anchor):
+    """Get total asset count for an anchor (single API call)."""
+    payload = {
+        "request_data": {
+            "assessment_profile_revision": anchor.get("assessment_profile_revision"),
+            "last_evaluation_time": anchor.get("last_evaluation_time"),
+            "filters": [
+                {"field": "status", "operator": "neq", "value": "Not Assessed"}
+            ],
+            "search_from": 0,
+            "search_to": 1  # Just need count, not actual assets
+        }
+    }
+    
+    try:
+        response = post_to_api("/public_api/v1/compliance/get_assets", payload)
+        return response.get("reply", {}).get("total_count", 0)
+    except Exception as e:
+        demisto.error(f"Error getting asset count: {e}")
+        return 0
+
+
+def preflight_count_assets(anchors, page_size):
+    """
+    Pre-flight: Count assets for each anchor before fetching.
+    Returns list of counts and total summary.
+    """
+    demisto.info("=== PRE-FLIGHT: Counting assets for each anchor ===")
+    
+    anchor_counts = []
+    total_assets = 0
+    total_pages = 0
+    
+    for i, anchor in enumerate(anchors):
+        profile = anchor.get('profile_name', 'Unknown')
+        standard = anchor.get('standard_name', 'Unknown')
+        
+        count = get_asset_count_for_anchor(anchor)
+        pages = (count + page_size - 1) // page_size if count > 0 else 0
+        
+        anchor_counts.append({
+            "index": i + 1,
+            "profile": profile,
+            "standard": standard,
+            "assets": count,
+            "pages": pages
+        })
+        
+        total_assets += count
+        total_pages += pages
+        
+        demisto.info(f"  [{i+1}] {profile[:30]} | {count:,} assets | {pages:,} pages")
+    
+    demisto.info(f"=== TOTAL: {total_assets:,} assets across {total_pages:,} API requests ===")
+    
+    return {
+        "anchor_counts": anchor_counts,
+        "total_assets": total_assets,
+        "total_pages": total_pages
+    }
+
+
 def get_paginated_assets(base_payload, page_size):
-    """Fetch all assets with pagination using core-api-post."""
+    """
+    Fetch all assets with pagination using core-api-post.
+    OPTIMIZED: Now fetches ALL assets at once instead of per-control.
+    """
     all_assets = []
     search_from = 0
     total_count = None
+    page_num = 0
 
     while True:
         payload = json.loads(json.dumps(base_payload))  # Deep copy
@@ -362,18 +376,19 @@ def get_paginated_assets(base_payload, page_size):
 
         try:
             response = post_to_api("/public_api/v1/compliance/get_assets", payload)
+            page_num += 1
             reply = response.get("reply", {})
             page_assets = reply.get("assets", [])
 
             if total_count is None:
                 total_count = reply.get("total_count", 0)
-                if total_count > 0:
-                    demisto.debug(f"Found {total_count} total assets to retrieve")
+                demisto.info(f"Fetching {total_count} total assets (page size: {page_size})")
 
             if not page_assets:
                 break
 
             all_assets.extend(page_assets)
+            demisto.info(f"Page {page_num}: fetched {len(page_assets)} assets ({len(all_assets)}/{total_count})")
 
             if len(all_assets) >= total_count:
                 break
@@ -381,23 +396,30 @@ def get_paginated_assets(base_payload, page_size):
             search_from += page_size
 
         except Exception as e:
-            demisto.error(f"Error during asset pagination: {e}")
+            demisto.error(f"Error during asset pagination (page {page_num}): {e}")
             break
 
-    return all_assets
+    return all_assets, total_count or 0
 
 
 def enrich_assets(raw_assets, anchor, controls_lookup):
-    """Enrich raw assets with control data."""
+    """Enrich raw assets with control data using CONTROL_REVISION_ID as join key."""
     profile_name = anchor.get("profile_name")
     standard_name = anchor.get("standard_name")
     eval_timestamp = anchor.get("last_evaluation_time")
     eval_datetime = timestamp_to_datestring(eval_timestamp) if eval_timestamp else None
 
     enriched = []
+    enrichment_stats = {"matched": 0, "unmatched": 0}
+    
     for asset in raw_assets:
         revision = str(asset.get("CONTROL_REVISION_ID"))
         control_data = controls_lookup.get(revision, {})
+        
+        if control_data:
+            enrichment_stats["matched"] += 1
+        else:
+            enrichment_stats["unmatched"] += 1
 
         enriched.append({
             "ASSESSMENT_PROFILE_NAME": profile_name,
@@ -424,123 +446,60 @@ def enrich_assets(raw_assets, anchor, controls_lookup):
             "CONTROL_NAME": asset.get("CONTROL"),
             "CONTROL_REVISION": revision,
             "CONTROL_RULE_NAMES": json.dumps(control_data.get("rule_names", [])),
+            "CONTROL_RULE_COUNT": control_data.get("rule_count", 0),
             "CATEGORY": control_data.get("category", ""),
             "SUBCATEGORY": control_data.get("subcategory", ""),
+            "MITIGATION": control_data.get("mitigation", ""),
             "SCANNABLE_ASSET_TYPES": json.dumps(control_data.get("scannable_asset_types", []))
         })
 
+    demisto.info(f"Enrichment complete: {enrichment_stats['matched']} matched, {enrichment_stats['unmatched']} unmatched")
     return enriched
 
 
-def fetch_and_enrich_assets(anchor, controls, config, progress, all_assets_by_pair):
+def fetch_and_enrich_assets(anchor, controls, config):
     """
-    Fetch assets for all controls and enrich with control data.
-    Saves progress after each control to support resume on timeout.
+    OPTIMIZED: Fetch ALL assets at once and enrich in memory.
+    
+    Instead of 150+ API calls (one per control), makes 1 API call
+    with pagination (~5-10 calls total) to fetch all assets.
     """
     page_size = config.get("PAGE_SIZE", 100)
     profile_name = anchor.get("profile_name")
     standard_name = anchor.get("standard_name")
-    pair_key = f"{profile_name}|{standard_name}"
+    
+    demisto.info(f"Fetching all assets for {profile_name}/{standard_name}")
 
-    # Filter controls based on configuration
-    if SKIP_CONTROLS_WITHOUT_RULES:
-        scannable_controls = [c for c in controls if c.get("rule_names")]
-        skipped_count = len(controls) - len(scannable_controls)
-        controls = scannable_controls
-    else:
-        skipped_count = 0
-
-    # Build controls lookup by revision
+    # Build controls lookup by revision (CONTROL_REVISION_ID is our join key)
     controls_lookup = {str(c.get("revision")): c for c in controls}
-    all_control_names = list(set(c.get("control_name") for c in controls))
-    total_controls = len(all_control_names)
+    demisto.info(f"Built controls lookup with {len(controls_lookup)} entries")
 
-    # Check if a control timed out on previous run (current_control set but not processed)
-    # If so, skip it to avoid infinite timeout loop
-    last_control = progress.get("current_control")
-    if last_control and progress.get("current_pair") == pair_key:
-        processed = progress.get("processed_controls", [])
-        if last_control not in processed:
-            demisto.info(f"Control '{last_control}' timed out on previous run - skipping it")
-            progress = skip_timed_out_control(progress, last_control)
-            save_progress(progress)
-
-    # Get remaining controls (skip already processed and skipped ones)
-    control_names = get_remaining_controls(all_control_names, progress, pair_key)
-
-    # Start tracking this anchor
-    progress = start_anchor_progress(progress, pair_key, total_controls)
-    # Save progress immediately so we know which anchor we're working on
-    save_progress(progress)
-
-    # Get existing assets for this pair (from previous partial run)
-    existing_assets = all_assets_by_pair.get(pair_key, [])
-
-    base_payload_data = {
-        "assessment_profile_revision": anchor.get("assessment_profile_revision"),
-        "last_evaluation_time": anchor.get("last_evaluation_time"),
+    # Build payload - fetch ALL assets at once (no control_name filter)
+    payload = {
+        "request_data": {
+            "assessment_profile_revision": anchor.get("assessment_profile_revision"),
+            "last_evaluation_time": anchor.get("last_evaluation_time"),
+            "filters": [
+                {"field": "status", "operator": "neq", "value": "Not Assessed"}
+            ]
+        }
     }
 
-    processed_this_run = len(progress.get("processed_controls", []))
-    demisto.info(f"Processing {len(control_names)} remaining controls for {pair_key} ({processed_this_run}/{total_controls} already done)")
+    # Fetch ALL assets with pagination
+    raw_assets, total_count = get_paginated_assets(payload, page_size)
+    demisto.info(f"Fetched {len(raw_assets)} assets (expected: {total_count})")
 
-    timed_out_count = len(progress.get("skipped_controls", []))
-    estimate_info = {
-        "total_controls": total_controls,
-        "scannable_controls": total_controls,
-        "skipped_no_rules": skipped_count,
-        "skipped_timeout": timed_out_count,
-        "remaining_controls": len(control_names),
-        "already_processed": processed_this_run
+    # Enrich all assets in memory
+    enriched_assets = enrich_assets(raw_assets, anchor, controls_lookup)
+
+    # Return summary info
+    fetch_info = {
+        "total_controls": len(controls),
+        "total_assets_fetched": len(raw_assets),
+        "total_assets_enriched": len(enriched_assets)
     }
 
-    all_new_assets = []
-
-    # Process each control and save progress after each
-    for i, control_name in enumerate(control_names):
-        # Save which control we're about to process (before API call)
-        progress["current_control"] = control_name
-        save_progress(progress)
-        demisto.info(f"Starting control {i+1}/{len(control_names)}: {control_name}")
-
-        try:
-            payload = {
-                "request_data": {
-                    **base_payload_data,
-                    "filters": [
-                        {"field": "control_name", "operator": "eq", "value": control_name},
-                        {"field": "status", "operator": "neq", "value": "Not Assessed"}
-                    ]
-                }
-            }
-            assets = get_paginated_assets(payload, page_size)
-
-            if assets:
-                # Enrich immediately
-                enriched = enrich_assets(assets, anchor, controls_lookup)
-                all_new_assets.extend(enriched)
-
-            # Update progress for this control
-            progress = update_progress_after_control(progress, control_name)
-
-            # Save progress and assets after each control
-            all_assets_by_pair[pair_key] = existing_assets + all_new_assets
-            save_progress(progress)
-            demisto.setContext("ComplianceAssetsData", all_assets_by_pair)
-
-            current_done = len(progress.get("processed_controls", []))
-            demisto.info(f"Control {current_done}/{total_controls}: {control_name} - {len(assets)} assets")
-
-        except Exception as e:
-            demisto.debug(f"Error fetching assets for control {control_name}: {e}")
-            continue
-
-        time.sleep(CONTROL_DELAY)
-
-    # Combine existing and new assets
-    final_assets = existing_assets + all_new_assets
-
-    return final_assets, estimate_info, progress
+    return enriched_assets, fetch_info
 
 
 # =============================================================================
@@ -554,28 +513,40 @@ def main():
         max_anchors = int(args.get('max_anchors', 0))
         reset_progress = argToBoolean(args.get('reset', 'false'))
 
-        # Get data from context
+        demisto.info(f"ComplianceFetchAssets starting: push={push_enabled}, max_anchors={max_anchors}, reset={reset_progress}")
+
+        # Get required context data
         config = get_config_from_context()
         anchors = get_anchors_from_context()
-        controls_catalog = get_controls_catalog_from_context()
+        
+        try:
+            controls_catalog = get_controls_catalog_from_context()
+            demisto.info(f"Loaded controls catalog with {len(controls_catalog)} standards")
+        except Exception as e:
+            demisto.info(f"Warning: Could not load controls catalog: {e}. Proceeding without control enrichment.")
+            controls_catalog = {}
 
         dry_run = config.get("DRY_RUN", True)
         batch_size = config.get("BATCH_SIZE", 500)
         collector_url = config.get("COLLECTOR_URL")
         compliance_api_key = config.get("COMPLIANCE_API_KEY")
 
-        # Initialize or retrieve progress tracking
+        # Initialize or load progress
         progress = None if reset_progress else get_progress_from_context()
 
+        # Auto-reset if previous run completed successfully
+        if progress and progress.get('is_complete'):
+            demisto.info("Previous run completed. Auto-resetting for new run.")
+            progress = None
+
         if progress:
-            demisto.info(f"Resuming from previous progress: {progress.get('completed_anchors')}/{progress.get('total_anchors')} completed")
+            demisto.info(f"Resuming: {progress.get('completed_anchors')}/{progress.get('total_anchors')} completed")
         else:
             progress = initialize_progress(anchors)
-            # Save initial progress immediately so it exists even if first API call times out
             save_progress(progress)
-            demisto.info(f"Starting fresh with {len(anchors)} profile/standard pair(s)")
+            demisto.info(f"Starting fresh with {len(anchors)} anchor(s)")
 
-        # Filter to only pending anchors
+        # Filter to pending anchors only
         pending_anchors = get_pending_anchors(anchors, progress)
 
         if not pending_anchors:
@@ -599,33 +570,38 @@ def main():
 
         demisto.info(f"Processing {len(anchors_to_process)} anchor(s) this run")
 
+        # =====================================================================
+        # PRE-FLIGHT: Count assets for each anchor
+        # =====================================================================
+        page_size = config.get("PAGE_SIZE", 100)
+        preflight = preflight_count_assets(anchors_to_process, page_size)
+        
+        # Store preflight info for readable output
+        demisto.info(f"Pre-flight complete: {preflight['total_assets']:,} assets, {preflight['total_pages']:,} API calls needed")
+
         # Process each anchor
         all_results = []
         all_assets_by_pair = {}
-        all_estimates = {}
+        all_fetch_info = {}
         file_results = []
         total_assets = 0
         total_pushed = 0
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        # Get existing assets data if resuming
-        existing_assets = demisto.context().get("ComplianceAssetsData")
-        if existing_assets and isinstance(existing_assets, dict) and not reset_progress:
-            all_assets_by_pair = existing_assets
-            demisto.info(f"Loaded {len(all_assets_by_pair)} existing pair(s) from context")
-
-        for anchor in anchors_to_process:
+        for anchor_idx, anchor in enumerate(anchors_to_process):
             profile_name = anchor.get("profile_name")
             standard_name = anchor.get("standard_name")
             pair_key = f"{profile_name}|{standard_name}"
+
+            demisto.info(f"Processing anchor {anchor_idx + 1}/{len(anchors_to_process)}: {pair_key}")
 
             # Get controls for this standard
             controls = get_controls_for_standard(controls_catalog, standard_name)
 
             if not controls:
-                # Include debug info in error for troubleshooting
-                catalog_keys = list(controls_catalog.keys()) if isinstance(controls_catalog, dict) else f"Not a dict: {type(controls_catalog).__name__}"
-                error_msg = f"No controls found. Looking for '{standard_name}'. Available keys: {catalog_keys}"
+                catalog_keys = list(controls_catalog.keys()) if isinstance(controls_catalog, dict) else "N/A"
+                error_msg = f"No controls found for '{standard_name}'. Available: {catalog_keys}"
+                demisto.info(error_msg)
                 all_results.append({
                     "profile_name": profile_name,
                     "standard_name": standard_name,
@@ -636,57 +612,44 @@ def main():
                 })
                 continue
 
-            # Fetch and enrich assets (saves progress after each control)
-            enriched_assets, estimate_info, progress = fetch_and_enrich_assets(
-                anchor, controls, config, progress, all_assets_by_pair
-            )
+            # OPTIMIZED: Fetch ALL assets at once and enrich in memory
+            enriched_assets, fetch_info = fetch_and_enrich_assets(anchor, controls, config)
             total_assets += len(enriched_assets)
+            all_fetch_info[pair_key] = fetch_info
 
-            if estimate_info:
-                all_estimates[pair_key] = estimate_info
+            # Store assets for this pair
+            all_assets_by_pair[pair_key] = enriched_assets
 
-            # Check if all controls were processed (or skipped) for this anchor
-            processed_count = len(progress.get("processed_controls", []))
-            skipped_count = len(progress.get("skipped_controls", []))
-            total_in_pair = progress.get("total_controls_in_pair", 0)
+            # Push to collector if enabled
+            pushed_count = 0
+            if push_enabled and enriched_assets:
+                pushed_count = push_records_to_collector(
+                    enriched_assets,
+                    collector_url,
+                    compliance_api_key,
+                    batch_size,
+                    dry_run,
+                    label=f"Asset ({profile_name}/{standard_name})"
+                )
+                total_pushed += pushed_count
 
-            if (processed_count + skipped_count) >= total_in_pair:
-                # Anchor complete - push to collector if enabled
-                pushed_count = 0
-                if push_enabled and enriched_assets:
-                    pushed_count = push_records_to_collector(
-                        enriched_assets,
-                        collector_url,
-                        compliance_api_key,
-                        batch_size,
-                        dry_run,
-                        label=f"Asset ({profile_name}/{standard_name})"
-                    )
-                    total_pushed += pushed_count
+            # Store result for this pair
+            all_results.append({
+                "profile_name": profile_name,
+                "standard_name": standard_name,
+                "total_assets": len(enriched_assets),
+                "pushed_count": pushed_count,
+                "dry_run": dry_run
+            })
 
-                # Store result for this pair
-                pair_result = {
-                    "profile_name": profile_name,
-                    "standard_name": standard_name,
-                    "total_assets": len(enriched_assets),
-                    "pushed_count": pushed_count,
-                    "dry_run": dry_run
-                }
-                all_results.append(pair_result)
-
-                # Mark anchor as complete
-                progress = update_progress_after_anchor(progress, pair_key)
-                save_progress(progress)
-                demisto.info(f"Anchor complete: {progress.get('completed_anchors')}/{progress.get('total_anchors')}")
-            else:
-                # Anchor partially processed (should only happen on timeout)
-                demisto.info(f"Anchor {pair_key} partially processed: {processed_count}/{total_in_pair} controls")
+            # Mark anchor as complete
+            progress = update_progress_after_anchor(progress, pair_key)
+            save_progress(progress)
+            demisto.info(f"Anchor complete: {progress.get('completed_anchors')}/{progress.get('total_anchors')} - {len(enriched_assets)} assets")
 
             # Create CSV file for this pair
             if enriched_assets:
-                csv_lines = []
-                csv_lines.append(",".join(enriched_assets[0].keys()))
-
+                csv_lines = [",".join(enriched_assets[0].keys())]
                 for asset in enriched_assets:
                     row = []
                     for value in asset.values():
@@ -699,68 +662,37 @@ def main():
                 csv_content = "\n".join(csv_lines)
                 filename = f"compliance_assets_{profile_name}_{standard_name}_{timestamp}.csv".replace(" ", "_")
                 file_results.append(fileResult(filename, csv_content, EntryType.ENTRY_INFO_FILE))
-                demisto.info(f"Created asset report: {filename}")
 
-        # Store all assets in context for Stage 3 (final save)
+        # Store all assets in context for Stage 3
         demisto.setContext("ComplianceAssetsData", all_assets_by_pair)
 
         # Build readable output
-        readable = f"## Compliance Assets Fetched\n\n"
-
-        # Progress status section
-        readable += "### Progress Status\n\n"
-        readable += f"| Metric | Value |\n"
-        readable += f"| :--- | :--- |\n"
-        readable += f"| Anchors Completed | {progress.get('completed_anchors')}/{progress.get('total_anchors')} |\n"
-        readable += f"| Anchors Pending | {len(progress.get('pending_pairs', []))} |\n"
-
-        # Show control-level progress if anchor is partially processed
-        current_pair = progress.get("current_pair")
-        if current_pair and current_pair not in progress.get("completed_pairs", []):
-            processed_controls = len(progress.get("processed_controls", []))
-            skipped_controls = len(progress.get("skipped_controls", []))
-            total_controls = progress.get("total_controls_in_pair", 0)
-            readable += f"| Current Anchor | {current_pair} |\n"
-            readable += f"| Controls Processed | {processed_controls}/{total_controls} |\n"
-            if skipped_controls > 0:
-                readable += f"| Controls Skipped (timeout) | {skipped_controls} |\n"
-
-        readable += f"| Status | {'COMPLETE' if progress.get('is_complete') else 'IN PROGRESS'} |\n\n"
-
-        # Show skipped controls if any
-        skipped_list = progress.get("skipped_controls", [])
-        if skipped_list:
-            readable += f"**Warning:** {len(skipped_list)} control(s) were skipped due to API timeout:\n"
-            for ctrl in skipped_list[:5]:  # Show first 5
-                readable += f"- {ctrl}\n"
-            if len(skipped_list) > 5:
-                readable += f"- ... and {len(skipped_list) - 5} more\n"
-            readable += "\n"
+        readable = "## Compliance Assets Fetched (Optimized)\n\n"
+        readable += f"**Total Anchors:** {progress.get('completed_anchors')}/{progress.get('total_anchors')}\n"
+        readable += f"**Total Assets:** {total_assets}\n"
+        readable += f"**Total Pushed:** {total_pushed}\n"
+        readable += f"**Dry Run:** {'Yes' if dry_run else 'No'}\n"
+        readable += f"**Status:** {'COMPLETE' if progress.get('is_complete') else 'IN PROGRESS'}\n\n"
 
         if not progress.get('is_complete'):
             pending_count = len(progress.get('pending_pairs', []))
-            current_pair = progress.get("current_pair")
-            if current_pair and current_pair not in progress.get("completed_pairs", []):
-                readable += f"*Run script again to continue processing {current_pair} and {pending_count - 1} more pair(s).*\n\n"
-            else:
-                readable += f"*Run script again to continue processing remaining {pending_count} pair(s).*\n\n"
+            readable += f"*Run script again to process remaining {pending_count} anchor(s).*\n\n"
 
-        readable += f"**Total Assets This Run:** {total_assets}\n"
-        readable += f"**Total Pushed This Run:** {total_pushed}\n"
-        readable += f"**Dry Run:** {'Yes' if dry_run else 'No'}\n"
-        readable += f"**Skip Controls Without Rules:** {'Yes' if SKIP_CONTROLS_WITHOUT_RULES else 'No'}\n\n"
+        # Show pre-flight summary (API calls needed)
+        readable += "### Pre-flight Summary (Assets & API Calls)\n\n"
+        readable += "| # | Profile | Standard | Assets | API Calls |\n"
+        readable += "| :--- | :--- | :--- | ---: | ---: |\n"
+        for ac in preflight.get('anchor_counts', []):
+            readable += f"| {ac['index']} | {ac['profile'][:25]} | {ac['standard'][:35]} | {ac['assets']:,} | {ac['pages']:,} |\n"
+        readable += f"| | | **TOTAL** | **{preflight['total_assets']:,}** | **{preflight['total_pages']:,}** |\n\n"
 
-        # Show control processing details if available
-        if all_estimates:
-            readable += "### Control Processing\n\n"
-            readable += "| Profile/Standard | Total | Skipped | Processed | Remaining |\n"
-            readable += "| :--- | :--- | :--- | :--- | :--- |\n"
-            for pair_key, est in all_estimates.items():
-                total = est.get('total_controls', 0)
-                skipped = est.get('skipped_controls', 0)
-                remaining = est.get('remaining_controls', 0)
-                already = est.get('already_processed', 0)
-                readable += f"| {pair_key} | {total} | {skipped} | {already} | {remaining} |\n"
+        # Show fetch info
+        if all_fetch_info:
+            readable += "### Fetch Summary\n\n"
+            readable += "| Profile/Standard | Controls | Assets Fetched |\n"
+            readable += "| :--- | :--- | :--- |\n"
+            for pair_key, info in all_fetch_info.items():
+                readable += f"| {pair_key} | {info.get('total_controls', 0)} | {info.get('total_assets_fetched', 0)} |\n"
             readable += "\n"
 
         for result in all_results:

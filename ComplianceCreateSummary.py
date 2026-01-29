@@ -65,7 +65,18 @@ def get_anchors_from_context():
 
 
 def get_controls_catalog_from_context():
-    """Retrieve controls catalog (dict keyed by standard) from context."""
+    """
+    Retrieve controls catalog (dict keyed by standard) from context.
+    
+    After Phase 1 optimization, the catalog is stored directly as a dict:
+    {
+        "Standard1": {"controls": [...], "standard_name": "...", "total_controls": N},
+        "Standard2": {"controls": [...], ...}
+    }
+    
+    Legacy format (before optimization) was a list that needed merging.
+    This function handles both formats for backwards compatibility.
+    """
     catalog = demisto.context().get("ComplianceControlsCatalog")
     if not catalog:
         raise DemistoException(
@@ -73,39 +84,36 @@ def get_controls_catalog_from_context():
             "Please run ComplianceGetControls first."
         )
 
-    # XSOAR stores dict outputs as a list of single-key dicts:
-    # [{'Standard1': {controls: [...]}}, {'Standard2': {controls: [...]}}]
-    # We need to merge them into one dict keyed by standard name.
-
-    if isinstance(catalog, list):
-        catalog_dict = {}
-        for item in catalog:
-            if isinstance(item, dict):
-                # Each item is {standard_name: {controls: [...], ...}}
-                for key, value in item.items():
-                    if isinstance(value, dict) and "controls" in value:
-                        catalog_dict[key] = value
-                    elif key == "standard_name" and "controls" in item:
-                        # Alternative structure: {standard_name: "X", controls: [...]}
-                        catalog_dict[value] = item
-            elif isinstance(item, str):
-                # Skip truncation messages like "...NOTE, too much data..."
-                continue
-        return catalog_dict
-
-    elif isinstance(catalog, dict):
-        # Check if it's a single standard entry
+    # NEW FORMAT (Phase 1): Direct dict keyed by standard name
+    if isinstance(catalog, dict):
+        # Check if already in correct format (keyed by standard name)
+        for key, val in catalog.items():
+            if isinstance(val, dict) and "controls" in val:
+                return catalog
+        
+        # Check if it's a single standard entry with flat structure
         if "standard_name" in catalog and "controls" in catalog:
             standard_name = catalog.get("standard_name")
             return {standard_name: catalog}
 
-        # Check if already keyed by standard name
-        for key, val in catalog.items():
-            if isinstance(val, dict) and "controls" in val:
-                return catalog
-
-        # Unexpected structure
+        # Unexpected dict structure - return as-is
         return catalog
+
+    # LEGACY FORMAT: List of dicts (from CommandResults with outputs_prefix)
+    # This handles old context data before the optimization was applied
+    elif isinstance(catalog, list):
+        catalog_dict = {}
+        for item in catalog:
+            if isinstance(item, dict):
+                for key, value in item.items():
+                    if isinstance(value, dict) and "controls" in value:
+                        catalog_dict[key] = value
+                    elif key == "standard_name" and "controls" in item:
+                        catalog_dict[value] = item
+            elif isinstance(item, str):
+                # Skip truncation messages
+                continue
+        return catalog_dict
 
     else:
         raise DemistoException(
@@ -203,7 +211,7 @@ def create_control_summary(controls, assets, anchor):
                 "CATEGORY": ctrl.get("category", ""),
                 "STATUS": "NOT_EVALUATED",
                 "SCORE": 0.0,
-                "RULES_COUNT": len(ctrl.get("rule_names", [])),
+                "RULES_COUNT": ctrl.get("rule_count", len(ctrl.get("rule_names", []))),
                 "PASSED_ASSETS": 0,
                 "FAILED_ASSETS": 0,
                 "NOT_ASSESSED_ASSETS": 0,
@@ -278,7 +286,7 @@ def create_control_summary(controls, assets, anchor):
             "CATEGORY": ctrl.get("category", ""),
             "STATUS": overall_status,
             "SCORE": round(score, 4),
-            "RULES_COUNT": len(ctrl.get("rule_names", [])),
+            "RULES_COUNT": ctrl.get("rule_count", len(ctrl.get("rule_names", []))),
             "PASSED_ASSETS": passed_count,
             "FAILED_ASSETS": failed_count,
             "NOT_ASSESSED_ASSETS": not_assessed_count,
