@@ -3,6 +3,7 @@
 Stage 1: Fetches all compliance controls for given standard(s).
 
 Automatically deduplicates to avoid fetching the same standard twice.
+Supports parallel fetching with configurable workers.
 
 Prerequisites:
     - ComplianceLoadConfig must be run first to load configuration to context.
@@ -15,6 +16,10 @@ Arguments:
                        Each item has:
                        - standard: The compliance standard name
                        - profiles: Array of profile names (used for context, not for fetching)
+    
+    parallel_workers (int): Optional. Number of parallel workers for fetching controls.
+                            Default: 1 (sequential). Set higher (e.g., 5) for faster execution.
+                            Note: Higher values may increase API rate limit risk.
 
 Outputs:
     Context path: ComplianceControlsCatalog (dict keyed by standard_name)
@@ -41,6 +46,8 @@ Example JSON (assessments argument):
 # from CommonServerPython import *
 import json
 import time
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # =============================================================================
 # CONFIGURATION
@@ -51,24 +58,48 @@ BATCH_DELAY = 0.3  # Delay between batches (seconds) - reduced from 0.2 per cont
 SAMPLE_SIZE = 5  # Number of controls to sample for time estimation
 TIMEOUT_BUFFER = 1.5  # Multiplier for recommended timeout (50% buffer)
 
+# Retry configuration
+MAX_RETRIES = 3  # Number of retry attempts for transient errors
+BASE_DELAY = 2.0  # Base delay for exponential backoff (seconds)
+RETRYABLE_ERROR_PATTERNS = [
+    "500", "502", "503", "504",  # Server errors
+    "429",  # Rate limit
+    "timeout", "timed out",  # Timeout errors
+    "connection", "network",  # Network errors
+    "temporary", "transient",  # Transient errors
+]
+
 
 # =============================================================================
 # API HELPERS
 # =============================================================================
 
+def is_retryable_error(error_msg):
+    """
+    Check if an error message indicates a retryable error.
+    """
+    error_lower = str(error_msg).lower()
+    return any(pattern in error_lower for pattern in RETRYABLE_ERROR_PATTERNS)
+
+
 def parse_api_response(result, operation):
     """
     Parse the response from a core-api-post command.
+    
+    Returns:
+        tuple: (response_dict, error_msg) - error_msg is None on success
     """
     if not result:
-        raise DemistoException(f"{operation}: Empty response from API")
+        return None, f"{operation}: Empty response from API"
 
     for entry in result:
         if not isinstance(entry, dict):
             continue
 
         if entry.get("Type") == 4:
-            continue
+            # Error entry - extract error message
+            error_msg = entry.get("Contents", str(entry))
+            return None, f"{operation}: {error_msg}"
 
         contents = entry.get("Contents", {})
         if not isinstance(contents, dict):
@@ -76,19 +107,56 @@ def parse_api_response(result, operation):
 
         response = contents.get("response", {})
         if response and "reply" in response:
-            return response
+            return response, None
 
     error_msg = get_error(result) if is_error(result) else "No valid response found"
-    raise DemistoException(f"{operation}: {error_msg}")
+    return None, f"{operation}: {error_msg}"
 
 
 def post_to_api(uri, body):
-    """Execute a POST request via core-api-post."""
-    result = demisto.executeCommand("core-api-post", {
-        "uri": uri,
-        "body": json.dumps(body)
-    })
-    return parse_api_response(result, f"POST {uri}")
+    """
+    Execute a POST request via core-api-post with automatic retry on transient errors.
+    
+    Retries on:
+    - Server errors (500, 502, 503, 504)
+    - Rate limiting (429)
+    - Timeout errors
+    - Network/connection errors
+    
+    Does NOT retry on:
+    - Client errors (400, 401, 403, 404)
+    - Permanent failures
+    """
+    last_error = None
+    
+    for attempt in range(MAX_RETRIES + 1):
+        result = demisto.executeCommand("core-api-post", {
+            "uri": uri,
+            "body": json.dumps(body)
+        })
+        
+        response, error_msg = parse_api_response(result, f"POST {uri}")
+        
+        if response is not None:
+            # Success!
+            return response
+        
+        # Check if error is retryable
+        if error_msg and is_retryable_error(error_msg):
+            last_error = error_msg
+            
+            if attempt < MAX_RETRIES:
+                # Exponential backoff with jitter
+                delay = (BASE_DELAY * (2 ** attempt)) + random.uniform(0.1, 1.0)
+                demisto.debug(f"Retryable error on {uri}: {error_msg}. Retrying in {delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(delay)
+                continue
+        else:
+            # Non-retryable error - fail immediately
+            raise DemistoException(error_msg or f"POST {uri}: Unknown error")
+    
+    # All retries exhausted
+    raise DemistoException(f"POST {uri}: Failed after {MAX_RETRIES} retries. Last error: {last_error}")
 
 
 # =============================================================================
@@ -203,9 +271,14 @@ def fetch_single_control_details(cid):
         return None
 
 
-def get_controls_catalog(standard_name):
+def get_controls_catalog(standard_name, parallel_workers=1):
     """
-    Fetch all controls for a compliance standard using batch processing.
+    Fetch all controls for a compliance standard.
+    
+    Args:
+        standard_name: The compliance standard name
+        parallel_workers: Number of parallel workers (1 = sequential)
+    
     Returns (controls_list, estimate_info).
     """
     # Get control IDs from standard
@@ -229,7 +302,7 @@ def get_controls_catalog(standard_name):
 
     total = len(control_ids)
 
-    # Sample first few controls and estimate time
+    # Sample first few controls and estimate time (sequential for accurate timing)
     avg_time, sampled_results, estimate_info = estimate_time_and_log(control_ids, standard_name)
     controls = sampled_results.copy()
     sample_count = min(SAMPLE_SIZE, total)
@@ -238,14 +311,38 @@ def get_controls_catalog(standard_name):
     remaining_ids = control_ids[sample_count:]
 
     if remaining_ids:
-        for i, cid in enumerate(remaining_ids):
-            result = fetch_single_control_details(cid)
-            if result:
-                controls.append(result)
+        if parallel_workers > 1:
+            # Parallel fetching using ThreadPoolExecutor
+            demisto.debug(f"Fetching {len(remaining_ids)} controls with {parallel_workers} parallel workers")
+            
+            with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+                # Submit all tasks
+                future_to_cid = {
+                    executor.submit(fetch_single_control_details, cid): cid 
+                    for cid in remaining_ids
+                }
+                
+                # Collect results as they complete
+                completed = 0
+                for future in as_completed(future_to_cid):
+                    result = future.result()
+                    if result:
+                        controls.append(result)
+                    completed += 1
+                    
+                    # Progress logging every 20 controls
+                    if completed % 20 == 0:
+                        demisto.debug(f"Progress: {completed + sample_count}/{total} controls")
+        else:
+            # Sequential fetching (original behavior)
+            for i, cid in enumerate(remaining_ids):
+                result = fetch_single_control_details(cid)
+                if result:
+                    controls.append(result)
 
-            # Batch delay
-            if (i + 1) % BATCH_SIZE == 0:
-                time.sleep(BATCH_DELAY)
+                # Batch delay (only in sequential mode)
+                if (i + 1) % BATCH_SIZE == 0:
+                    time.sleep(BATCH_DELAY)
 
     return controls, estimate_info
 
@@ -339,6 +436,13 @@ def main():
         if not standard_list:
             raise DemistoException("No standards found in input.")
 
+        # Parse parallel_workers argument (default: 1 = sequential)
+        parallel_workers = int(args.get('parallel_workers', 1))
+        if parallel_workers < 1:
+            parallel_workers = 1
+        
+        demisto.debug(f"Using {parallel_workers} parallel worker(s) for control fetching")
+
         # Fetch controls for each unique standard
         controls_catalog = {}
         estimates = {}
@@ -347,7 +451,7 @@ def main():
 
         for standard_name in standard_list:
             try:
-                controls, estimate_info = get_controls_catalog(standard_name)
+                controls, estimate_info = get_controls_catalog(standard_name, parallel_workers)
                 controls_catalog[standard_name] = {
                     "standard_name": standard_name,
                     "total_controls": len(controls),

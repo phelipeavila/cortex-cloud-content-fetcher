@@ -2,6 +2,8 @@
 
 Stage 0: Finds the latest assessment run anchor for given profile/standard pairs.
 
+Supports parallel fetching with configurable workers.
+
 Prerequisites:
     - ComplianceLoadConfig must be run first to load configuration to context.
 
@@ -13,6 +15,10 @@ Arguments:
                        Each item has:
                        - standard: The compliance standard name
                        - profiles: Array of profile names to assess against this standard
+    
+    parallel_workers (int): Optional. Number of parallel workers for fetching anchors.
+                            Default: 1 (sequential). Set higher (e.g., 5) for faster execution.
+                            Note: Higher values may increase API rate limit risk.
 
 Outputs:
     Context path: ComplianceAnchors (list of anchor objects)
@@ -45,11 +51,38 @@ Example JSON (assessments argument):
 
 # from CommonServerPython import *
 import json
+import time
+import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Retry configuration
+MAX_RETRIES = 3  # Number of retry attempts for transient errors
+BASE_DELAY = 2.0  # Base delay for exponential backoff (seconds)
+RETRYABLE_ERROR_PATTERNS = [
+    "500", "502", "503", "504",  # Server errors
+    "429",  # Rate limit
+    "timeout", "timed out",  # Timeout errors
+    "connection", "network",  # Network errors
+    "temporary", "transient",  # Transient errors
+]
 
 
 # =============================================================================
 # API HELPERS
 # =============================================================================
+
+def is_retryable_error(error_msg):
+    """
+    Check if an error message indicates a retryable error.
+    """
+    error_lower = str(error_msg).lower()
+    return any(pattern in error_lower for pattern in RETRYABLE_ERROR_PATTERNS)
+
 
 def parse_api_response(result, operation):
     """
@@ -57,17 +90,21 @@ def parse_api_response(result, operation):
 
     Handles edge cases where the API may return error entries
     followed by the actual valid response.
+    
+    Returns:
+        tuple: (response_dict, error_msg) - error_msg is None on success
     """
     if not result:
-        raise DemistoException(f"{operation}: Empty response from API")
+        return None, f"{operation}: Empty response from API"
 
     for entry in result:
         if not isinstance(entry, dict):
             continue
 
-        # Skip error entries (Type 4 = error)
+        # Error entry (Type 4 = error) - extract error message
         if entry.get("Type") == 4:
-            continue
+            error_msg = entry.get("Contents", str(entry))
+            return None, f"{operation}: {error_msg}"
 
         contents = entry.get("Contents", {})
         if not isinstance(contents, dict):
@@ -75,20 +112,57 @@ def parse_api_response(result, operation):
 
         response = contents.get("response", {})
         if response and "reply" in response:
-            return response
+            return response, None
 
     # No valid response found
     error_msg = get_error(result) if is_error(result) else "No valid response found"
-    raise DemistoException(f"{operation}: {error_msg}")
+    return None, f"{operation}: {error_msg}"
 
 
 def post_to_api(uri, body):
-    """Execute a POST request via core-api-post."""
-    result = demisto.executeCommand("core-api-post", {
-        "uri": uri,
-        "body": json.dumps(body)
-    })
-    return parse_api_response(result, f"POST {uri}")
+    """
+    Execute a POST request via core-api-post with automatic retry on transient errors.
+    
+    Retries on:
+    - Server errors (500, 502, 503, 504)
+    - Rate limiting (429)
+    - Timeout errors
+    - Network/connection errors
+    
+    Does NOT retry on:
+    - Client errors (400, 401, 403, 404)
+    - Permanent failures
+    """
+    last_error = None
+    
+    for attempt in range(MAX_RETRIES + 1):
+        result = demisto.executeCommand("core-api-post", {
+            "uri": uri,
+            "body": json.dumps(body)
+        })
+        
+        response, error_msg = parse_api_response(result, f"POST {uri}")
+        
+        if response is not None:
+            # Success!
+            return response
+        
+        # Check if error is retryable
+        if error_msg and is_retryable_error(error_msg):
+            last_error = error_msg
+            
+            if attempt < MAX_RETRIES:
+                # Exponential backoff with jitter
+                delay = (BASE_DELAY * (2 ** attempt)) + random.uniform(0.1, 1.0)
+                demisto.debug(f"Retryable error on {uri}: {error_msg}. Retrying in {delay:.1f}s (attempt {attempt + 1}/{MAX_RETRIES})")
+                time.sleep(delay)
+                continue
+        else:
+            # Non-retryable error - fail immediately
+            raise DemistoException(error_msg or f"POST {uri}: Unknown error")
+    
+    # All retries exhausted
+    raise DemistoException(f"POST {uri}: Failed after {MAX_RETRIES} retries. Last error: {last_error}")
 
 
 # =============================================================================
@@ -227,6 +301,18 @@ def parse_assessments_input(args):
 # MAIN FUNCTION
 # =============================================================================
 
+def fetch_anchor_safe(profile_name, standard_name):
+    """
+    Wrapper for get_assessment_anchor that catches exceptions.
+    Returns (anchor, error_msg) tuple.
+    """
+    try:
+        anchor = get_assessment_anchor(profile_name, standard_name)
+        return anchor, None
+    except Exception as e:
+        return None, f"{profile_name}/{standard_name}: {str(e)}"
+
+
 def main():
     try:
         args = demisto.args()
@@ -235,19 +321,50 @@ def main():
         assessment_pairs = parse_assessments_input(args)
         demisto.info(f"Finding anchors for {len(assessment_pairs)} profile/standard pair(s)")
 
+        # Parse parallel_workers argument (default: 1 = sequential)
+        parallel_workers = int(args.get('parallel_workers', 1))
+        if parallel_workers < 1:
+            parallel_workers = 1
+        
+        demisto.debug(f"Using {parallel_workers} parallel worker(s) for anchor fetching")
+
         # Find anchor for each pair
         anchors = []
         errors = []
 
-        for profile_name, standard_name in assessment_pairs:
-            try:
-                anchor = get_assessment_anchor(profile_name, standard_name)
-                anchors.append(anchor)
-                demisto.info(f"Found anchor for {profile_name}/{standard_name}")
-            except Exception as e:
-                error_msg = f"{profile_name}/{standard_name}: {str(e)}"
-                errors.append(error_msg)
-                demisto.error(f"Failed to get anchor: {error_msg}")
+        if parallel_workers > 1 and len(assessment_pairs) > 1:
+            # Parallel fetching using ThreadPoolExecutor
+            demisto.debug(f"Fetching {len(assessment_pairs)} anchors with {parallel_workers} parallel workers")
+            
+            with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
+                # Submit all tasks
+                future_to_pair = {
+                    executor.submit(fetch_anchor_safe, profile, standard): (profile, standard)
+                    for profile, standard in assessment_pairs
+                }
+                
+                # Collect results as they complete
+                for future in as_completed(future_to_pair):
+                    profile, standard = future_to_pair[future]
+                    anchor, error_msg = future.result()
+                    
+                    if anchor:
+                        anchors.append(anchor)
+                        demisto.debug(f"Found anchor for {profile}/{standard}")
+                    else:
+                        errors.append(error_msg)
+                        demisto.error(f"Failed to get anchor: {error_msg}")
+        else:
+            # Sequential fetching (original behavior)
+            for profile_name, standard_name in assessment_pairs:
+                try:
+                    anchor = get_assessment_anchor(profile_name, standard_name)
+                    anchors.append(anchor)
+                    demisto.info(f"Found anchor for {profile_name}/{standard_name}")
+                except Exception as e:
+                    error_msg = f"{profile_name}/{standard_name}: {str(e)}"
+                    errors.append(error_msg)
+                    demisto.error(f"Failed to get anchor: {error_msg}")
 
         if not anchors:
             raise DemistoException(f"Failed to find any anchors. Errors: {'; '.join(errors)}")

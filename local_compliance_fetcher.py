@@ -6,13 +6,15 @@ A standalone script to fetch compliance data from Cortex Cloud APIs.
 This is a local version of the XSOAR scripts for testing and development.
 
 Usage:
-    1. Create a config.env file with your credentials
-    2. Run: python local_compliance_fetcher.py
+    python local_compliance_fetcher.py           # Normal mode (progress bars only)
+    python local_compliance_fetcher.py --debug   # Debug mode (verbose output)
+    python local_compliance_fetcher.py --dry-run # Don't push to collector
 
 Requirements:
-    pip install requests python-dotenv
+    pip install requests python-dotenv rich
 """
 
+import argparse
 import json
 import os
 import sys
@@ -29,8 +31,161 @@ try:
     from dotenv import load_dotenv
 except ImportError:
     print("Missing dependencies. Install with:")
-    print("  pip install requests python-dotenv")
+    print("  pip install requests python-dotenv rich")
     sys.exit(1)
+
+# Rich imports with fallback
+try:
+    from rich.console import Console
+    from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, TaskProgressColumn, MofNCompleteColumn
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich import box
+    RICH_AVAILABLE = True
+except ImportError:
+    RICH_AVAILABLE = False
+    print("⚠ Rich not installed. Install with: pip install rich")
+    print("  Falling back to basic output.\n")
+
+
+# =============================================================================
+# OUTPUT MANAGER
+# =============================================================================
+
+class Output:
+    """Manages output based on verbosity level."""
+    
+    def __init__(self, debug: bool = False):
+        self.debug = debug
+        self.console = Console() if RICH_AVAILABLE else None
+        self._retry_count = 0
+    
+    def _print(self, msg: str):
+        """Print using Rich if available, else plain print."""
+        if self.console:
+            self.console.print(msg)
+        else:
+            # Strip rich markup for plain output
+            import re
+            plain = re.sub(r'\[/?[^\]]+\]', '', msg)
+            print(plain)
+    
+    def header(self, title: str):
+        """Print a stage header."""
+        if self.console and RICH_AVAILABLE:
+            self.console.print()
+            self.console.print(Panel(title, style="bold cyan", box=box.DOUBLE))
+        else:
+            print("\n" + "="*60)
+            print(f"  {title}")
+            print("="*60)
+    
+    def info(self, msg: str):
+        """Always shown - important info."""
+        self._print(msg)
+    
+    def success(self, msg: str):
+        """Always shown - success message."""
+        self._print(f"[green]✓ {msg}[/green]")
+    
+    def warning(self, msg: str):
+        """Only shown with --debug."""
+        if self.debug:
+            self._print(f"[yellow]⚠ {msg}[/yellow]")
+    
+    def error(self, msg: str):
+        """Always shown - error message."""
+        self._print(f"[red]❌ {msg}[/red]")
+    
+    def debug_msg(self, msg: str):
+        """Only shown with --debug."""
+        if self.debug:
+            self._print(f"[dim]{msg}[/dim]")
+    
+    def retry(self, endpoint: str, status_info: str, error_type: str, delay: float, attempt: int, max_retries: int):
+        """Log retry attempt - only shown with --debug."""
+        self._retry_count += 1
+        if self.debug:
+            self._print(f"[yellow]  ⚠ {endpoint} failed{status_info}: {error_type}. Retrying in {delay:.1f}s ({attempt}/{max_retries})[/yellow]")
+    
+    def table(self, title: str, columns: List[str], rows: List[List[str]]):
+        """Display a table."""
+        if self.console and RICH_AVAILABLE:
+            table = Table(title=title, box=box.ROUNDED, show_header=True, header_style="bold")
+            for col in columns:
+                table.add_column(col)
+            for row in rows:
+                table.add_row(*[str(c) for c in row])
+            self.console.print(table)
+        else:
+            print(f"\n{title}")
+            print("-" * 60)
+            print(" | ".join(columns))
+            print("-" * 60)
+            for row in rows:
+                print(" | ".join(str(c) for c in row))
+            print()
+    
+    def final_summary(self, stats: dict, elapsed: float):
+        """Display final summary."""
+        if self.console and RICH_AVAILABLE:
+            table = Table(title="Execution Summary", box=box.ROUNDED, show_header=False)
+            table.add_column("Metric", style="cyan")
+            table.add_column("Value", style="green")
+            
+            table.add_row("Total Time", f"{elapsed:.1f} seconds")
+            table.add_row("Anchors", str(stats.get('anchors', 0)))
+            table.add_row("Controls", str(stats.get('controls', 0)))
+            table.add_row("Assets", f"{stats.get('assets', 0):,}")
+            table.add_row("Summaries", str(stats.get('summaries', 0)))
+            
+            if self._retry_count > 0:
+                table.add_row("API Retries", str(self._retry_count))
+            
+            assets_status = stats.get('assets_push', 'skipped')
+            summaries_status = stats.get('summaries_push', 'skipped')
+            table.add_row("Assets Push", assets_status)
+            table.add_row("Summaries Push", summaries_status)
+            
+            self.console.print()
+            self.console.print(table)
+        else:
+            print("\n" + "="*60)
+            print("  COMPLETE")
+            print("="*60)
+            print(f"  Total time: {elapsed:.1f} seconds")
+            print(f"  Anchors: {stats.get('anchors', 0)}")
+            print(f"  Controls: {stats.get('controls', 0)}")
+            print(f"  Assets: {stats.get('assets', 0):,}")
+            print(f"  Summaries: {stats.get('summaries', 0)}")
+            if self._retry_count > 0:
+                print(f"  API Retries: {self._retry_count}")
+
+
+# Global output instance
+out: Output = None
+
+
+# =============================================================================
+# PROGRESS BARS
+# =============================================================================
+
+def create_progress() -> Progress:
+    """Create a Rich Progress instance."""
+    if not RICH_AVAILABLE:
+        return None
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[bold blue]{task.description}"),
+        BarColumn(bar_width=40),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TextColumn("•"),
+        TimeElapsedColumn(),
+        console=out.console if out else Console(),
+        transient=False
+    )
 
 
 # =============================================================================
@@ -40,15 +195,14 @@ except ImportError:
 class Config:
     """Configuration loaded from environment variables."""
     
-    def __init__(self):
+    def __init__(self, dry_run_override: bool = None):
         # Load from config.env file
         env_file = Path(__file__).parent / "config.env"
         if env_file.exists():
             load_dotenv(env_file)
-            print(f"✓ Loaded config from {env_file}")
+            out.debug_msg(f"Loaded config from {env_file}")
         else:
-            print(f"⚠ No config.env found at {env_file}")
-            print("  Create one based on config.env.example")
+            out.warning(f"No config.env found at {env_file}")
         
         # Required API credentials
         self.API_URL = os.getenv("API_URL", "").rstrip("/")
@@ -58,13 +212,11 @@ class Config:
         # Tenant URL (for building collector URL)
         self.TENANT_EXTERNAL_URL = os.getenv("TENANT_EXTERNAL_URL", "")
         
-        # HTTP Collector API keys (for pushing data to collector)
-        # COMPLIANCE_API_KEY - Used by assets push (ComplianceFetchAssets)
-        # CONTROLS_API_KEY - Used by summary push (ComplianceCreateSummary)
+        # HTTP Collector API keys
         self.COMPLIANCE_API_KEY = os.getenv("COMPLIANCE_API_KEY", "")
         self.CONTROLS_API_KEY = os.getenv("CONTROLS_API_KEY", "")
         
-        # Build collector URL from tenant URL
+        # Build collector URL
         if self.TENANT_EXTERNAL_URL:
             self.COLLECTOR_URL = f"https://api-{self.TENANT_EXTERNAL_URL}/logs/v1/event"
         else:
@@ -77,6 +229,8 @@ class Config:
         self.PAGE_SIZE = int(os.getenv("PAGE_SIZE", "100"))
         self.BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
         self.DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
+        if dry_run_override is not None:
+            self.DRY_RUN = dry_run_override
         self.MAX_ANCHORS = int(os.getenv("MAX_ANCHORS", "0"))
         self.PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "5"))
         
@@ -99,29 +253,16 @@ class Config:
             errors.append("ASSESSMENTS is required (JSON array)")
         
         if errors:
-            print("\n❌ Configuration errors:")
+            out.error("Configuration errors:")
             for e in errors:
-                print(f"   - {e}")
-            print("\nPlease check your config.env file.")
+                out.info(f"   - {e}")
+            out.info("\nPlease check your config.env file.")
             sys.exit(1)
         
-        print(f"✓ API URL: {self.API_URL}")
-        print(f"✓ Assessments: {len(self.ASSESSMENTS)} standard(s)")
-        print(f"✓ Output directory: {self.OUTPUT_DIR}")
-        
-        # Show collector status
-        if self.COLLECTOR_URL:
-            print(f"✓ Collector URL: {self.COLLECTOR_URL}")
-            if self.COMPLIANCE_API_KEY:
-                print(f"✓ COMPLIANCE_API_KEY: configured")
-            else:
-                print(f"⚠ COMPLIANCE_API_KEY: not set (assets won't be pushed)")
-            if self.CONTROLS_API_KEY:
-                print(f"✓ CONTROLS_API_KEY: configured")
-            else:
-                print(f"⚠ CONTROLS_API_KEY: not set (summaries won't be pushed)")
-        else:
-            print(f"⚠ No collector URL (TENANT_EXTERNAL_URL not set)")
+        out.debug_msg(f"API URL: {self.API_URL}")
+        out.debug_msg(f"Assessments: {len(self.ASSESSMENTS)} standard(s)")
+        out.debug_msg(f"Output: {self.OUTPUT_DIR}")
+        out.debug_msg(f"Dry run: {self.DRY_RUN}")
 
 
 # =============================================================================
@@ -131,9 +272,8 @@ class Config:
 class CortexAPIClient:
     """Client for Cortex Cloud Compliance APIs with automatic retry."""
     
-    # Retry configuration
     MAX_RETRIES = 5
-    BASE_DELAY = 2.0  # seconds
+    BASE_DELAY = 2.0
     RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
     
     def __init__(self, config: Config):
@@ -148,17 +288,7 @@ class CortexAPIClient:
         self.session.headers.update(self.headers)
     
     def post(self, endpoint: str, body: dict, timeout: int = 120) -> dict:
-        """
-        Make a POST request to the API with automatic retry on transient errors.
-        
-        Retries on:
-        - Network errors (ConnectionError, Timeout, etc.)
-        - Server errors (500, 502, 503, 504)
-        - Rate limiting (429)
-        
-        Does NOT retry on:
-        - Client errors (400, 401, 403, 404) except 429
-        """
+        """Make a POST request with automatic retry on transient errors."""
         url = f"{self.base_url}{endpoint}"
         last_exception = None
         
@@ -166,50 +296,38 @@ class CortexAPIClient:
             try:
                 response = self.session.post(url, json=body, timeout=timeout)
                 
-                # Check if we should retry based on status code
                 if response.status_code in self.RETRYABLE_STATUS_CODES:
-                    # Force raise to trigger retry
                     response.raise_for_status()
                 
-                # For other errors (4xx except 429), raise immediately without retry
                 response.raise_for_status()
-                
-                # Success!
                 return response.json()
                 
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout,
                     requests.exceptions.ChunkedEncodingError) as e:
-                # Network errors - always retry
                 last_exception = e
                 
             except requests.exceptions.HTTPError as e:
-                # Only retry 5xx and 429, not other 4xx errors
                 if e.response is not None and e.response.status_code not in self.RETRYABLE_STATUS_CODES:
-                    # Client error (400, 401, 403, 404) - don't retry
-                    print(f"❌ HTTP Error: {e}")
-                    print(f"   Response: {e.response.text[:500]}")
+                    out.error(f"HTTP Error: {e}")
+                    out.debug_msg(f"Response: {e.response.text[:500]}")
                     raise
                 last_exception = e
                 
             except requests.exceptions.RequestException as e:
-                # Other request errors - retry
                 last_exception = e
             
-            # If we get here, we need to retry
             if attempt < self.MAX_RETRIES:
-                # Exponential backoff with jitter
                 delay = (self.BASE_DELAY * (2 ** attempt)) + random.uniform(0.1, 1.0)
                 error_type = type(last_exception).__name__
                 status_info = ""
                 if hasattr(last_exception, 'response') and last_exception.response is not None:
                     status_info = f" (HTTP {last_exception.response.status_code})"
                 
-                print(f"  ⚠ {endpoint} failed{status_info}: {error_type}. Retrying in {delay:.1f}s (attempt {attempt+1}/{self.MAX_RETRIES})")
+                out.retry(endpoint, status_info, error_type, delay, attempt + 1, self.MAX_RETRIES)
                 time.sleep(delay)
         
-        # All retries exhausted
-        print(f"❌ Failed after {self.MAX_RETRIES} retries: {endpoint}")
+        out.error(f"Failed after {self.MAX_RETRIES} retries: {endpoint}")
         if last_exception:
             raise last_exception
         raise Exception(f"Failed after {self.MAX_RETRIES} retries: {endpoint}")
@@ -220,23 +338,16 @@ class CortexAPIClient:
 # =============================================================================
 
 def get_all_assessment_results(client: CortexAPIClient) -> List[dict]:
-    """Fetch all assessment results from the API (no filters allowed)."""
-    # The API only allows 'labels' filter, so we fetch all and filter client-side
+    """Fetch all assessment results from the API."""
     body = {"request_data": {"filters": []}}
-    
     response = client.post("/public_api/v1/compliance/get_assessment_results", body)
-    # API returns data in "reply.data" (not "reply.assessment_results")
-    results = response.get("reply", {}).get("data", [])
-    
-    return results
+    return response.get("reply", {}).get("data", [])
 
 
 def find_anchor_for_pair(all_results: List[dict], profile_name: str, standard_name: str) -> Optional[dict]:
-    """Find the latest assessment anchor for a profile/standard pair from cached results."""
-    print(f"  Finding anchor for: {profile_name} / {standard_name[:50]}...")
+    """Find the latest assessment anchor for a profile/standard pair."""
+    out.debug_msg(f"  Finding anchor: {profile_name} / {standard_name[:50]}...")
     
-    # Filter client-side for matching profile and standard
-    # Match by TYPE=profile, ASSESSMENT_PROFILE, and STANDARD_NAME
     matches = [
         r for r in all_results
         if (str(r.get("TYPE", "")).lower() == "profile" and
@@ -245,16 +356,14 @@ def find_anchor_for_pair(all_results: List[dict], profile_name: str, standard_na
     ]
     
     if not matches:
-        print(f"    ⚠ No assessment results found for this profile/standard")
+        out.debug_msg(f"    No results found for this profile/standard")
         return None
     
-    # Filter for valid results with revision
     valid_results = [r for r in matches if r.get("ASSESSMENT_PROFILE_REVISION")]
     if not valid_results:
-        print(f"    ⚠ No valid assessment results (missing revision)")
+        out.debug_msg(f"    No valid results (missing revision)")
         return None
     
-    # Get the latest by evaluation time
     latest = max(valid_results, key=lambda x: int(x.get("LAST_EVALUATION_TIME", 0)))
     
     anchor = {
@@ -266,37 +375,45 @@ def find_anchor_for_pair(all_results: List[dict], profile_name: str, standard_na
     }
     
     eval_time = datetime.fromtimestamp(anchor["last_evaluation_time"] / 1000)
-    print(f"    ✓ Found anchor (evaluated: {eval_time})")
+    out.debug_msg(f"    Found anchor (evaluated: {eval_time})")
     
     return anchor
 
 
 def get_all_anchors(client: CortexAPIClient, assessments: List[dict]) -> List[dict]:
     """Get anchors for all profile/standard pairs."""
-    print("\n" + "="*60)
-    print("STAGE 1: Getting Assessment Anchors")
-    print("="*60)
+    out.header("Stage 1: Getting Assessment Anchors")
     
-    # Fetch all assessment results once (API doesn't support profile/standard filters)
-    print("  Fetching all assessment results...")
+    out.debug_msg("Fetching all assessment results...")
     all_results = get_all_assessment_results(client)
-    print(f"  ✓ Retrieved {len(all_results)} total assessment results")
+    out.debug_msg(f"Retrieved {len(all_results)} total assessment results")
     
     anchors = []
+    pairs_to_check = []
     
     for assessment in assessments:
         standard = assessment.get("standard")
         profiles = assessment.get("profiles", [])
-        
         if isinstance(profiles, str):
             profiles = [profiles]
-        
         for profile in profiles:
+            pairs_to_check.append((profile, standard))
+    
+    if RICH_AVAILABLE:
+        with create_progress() as progress:
+            task = progress.add_task("Finding anchors", total=len(pairs_to_check))
+            for profile, standard in pairs_to_check:
+                anchor = find_anchor_for_pair(all_results, profile, standard)
+                if anchor:
+                    anchors.append(anchor)
+                progress.update(task, advance=1)
+    else:
+        for profile, standard in pairs_to_check:
             anchor = find_anchor_for_pair(all_results, profile, standard)
             if anchor:
                 anchors.append(anchor)
     
-    print(f"\n✓ Found {len(anchors)} anchor(s)")
+    out.success(f"Found {len(anchors)} anchor(s)")
     return anchors
 
 
@@ -337,17 +454,17 @@ def fetch_single_control(client: CortexAPIClient, control_id: str) -> Optional[d
             "subcategory": ctrl.get("SUBCATEGORY", ""),
             "rule_count": len(rule_names),
             "rule_names": rule_names,
+            "mitigation": ctrl.get("MITIGATION", ""),
             "scannable_asset_types": scannable_asset_types
         }
-    except Exception as e:
+    except Exception:
         return None
 
 
-def get_controls_for_standard(client: CortexAPIClient, standard_name: str, parallel_workers: int = 5) -> List[dict]:
+def get_controls_for_standard(client: CortexAPIClient, standard_name: str, parallel_workers: int, progress=None, task_id=None) -> List[dict]:
     """Fetch all controls for a standard using parallel requests."""
-    print(f"\n  Fetching controls for: {standard_name[:60]}...")
+    out.debug_msg(f"Fetching controls for: {standard_name[:60]}...")
     
-    # Get control IDs from standard
     body = {
         "request_data": {
             "filters": [{"field": "name", "operator": "eq", "value": standard_name}]
@@ -357,78 +474,91 @@ def get_controls_for_standard(client: CortexAPIClient, standard_name: str, paral
     
     standards = response.get("reply", {}).get("standards", [])
     if not standards:
-        print(f"    ⚠ Standard not found")
+        out.debug_msg(f"Standard not found")
         return []
     
     control_ids = list(set(standards[0].get("controls_ids", [])))
     total = len(control_ids)
-    print(f"    Found {total} control IDs")
+    out.debug_msg(f"Found {total} control IDs")
     
     if not control_ids:
         return []
     
-    # Fetch controls in parallel
     controls = []
-    completed = 0
-    
-    print(f"    Fetching control details (using {parallel_workers} workers)...")
-    start_time = time.time()
     
     with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
         futures = {executor.submit(fetch_single_control, client, cid): cid for cid in control_ids}
         
         for future in as_completed(futures):
-            completed += 1
             result = future.result()
             if result:
                 controls.append(result)
-            
-            # Progress update every 20 controls
-            if completed % 20 == 0 or completed == total:
-                elapsed = time.time() - start_time
-                rate = completed / elapsed if elapsed > 0 else 0
-                print(f"      Progress: {completed}/{total} ({rate:.1f}/sec)")
+            if progress and task_id is not None:
+                progress.update(task_id, advance=1)
     
-    elapsed = time.time() - start_time
-    print(f"    ✓ Fetched {len(controls)} active controls in {elapsed:.1f}s")
-    
+    out.debug_msg(f"Fetched {len(controls)} active controls")
     return controls
 
 
-def get_all_controls(client: CortexAPIClient, assessments: List[dict], parallel_workers: int = 5) -> Dict[str, dict]:
+def get_all_controls(client: CortexAPIClient, assessments: List[dict], parallel_workers: int) -> Dict[str, dict]:
     """Get controls catalog for all standards."""
-    print("\n" + "="*60)
-    print("STAGE 2: Getting Controls Catalog")
-    print("="*60)
+    out.header("Stage 2: Getting Controls Catalog")
     
-    # Get unique standards
     standards = set()
     for assessment in assessments:
         standards.add(assessment.get("standard"))
     
-    print(f"Processing {len(standards)} unique standard(s)")
+    out.debug_msg(f"Processing {len(standards)} unique standard(s)")
+    
+    # First, get all control IDs to calculate total
+    standard_control_ids = {}
+    total_controls = 0
+    for standard_name in standards:
+        body = {
+            "request_data": {
+                "filters": [{"field": "name", "operator": "eq", "value": standard_name}]
+            }
+        }
+        response = client.post("/public_api/v1/compliance/get_standards", body)
+        std_list = response.get("reply", {}).get("standards", [])
+        if std_list:
+            control_ids = list(set(std_list[0].get("controls_ids", [])))
+            standard_control_ids[standard_name] = control_ids
+            total_controls += len(control_ids)
     
     catalog = {}
-    for standard_name in standards:
-        controls = get_controls_for_standard(client, standard_name, parallel_workers)
-        catalog[standard_name] = {
-            "standard_name": standard_name,
-            "total_controls": len(controls),
-            "controls": controls
-        }
     
-    total_controls = sum(len(c["controls"]) for c in catalog.values())
-    print(f"\n✓ Total controls in catalog: {total_controls}")
+    if RICH_AVAILABLE and total_controls > 0:
+        with create_progress() as progress:
+            task = progress.add_task("Fetching controls", total=total_controls)
+            for standard_name in standards:
+                controls = get_controls_for_standard(client, standard_name, parallel_workers, progress, task)
+                catalog[standard_name] = {
+                    "standard_name": standard_name,
+                    "total_controls": len(controls),
+                    "controls": controls
+                }
+    else:
+        for standard_name in standards:
+            controls = get_controls_for_standard(client, standard_name, parallel_workers)
+            catalog[standard_name] = {
+                "standard_name": standard_name,
+                "total_controls": len(controls),
+                "controls": controls
+            }
+    
+    total = sum(len(c["controls"]) for c in catalog.values())
+    out.success(f"Total controls: {total}")
     
     return catalog
 
 
 # =============================================================================
-# STAGE 3: FETCH ASSETS (PARALLEL)
+# STAGE 3: FETCH ASSETS
 # =============================================================================
 
 def fetch_asset_page(client: CortexAPIClient, anchor: dict, search_from: int, page_size: int) -> Tuple[int, List[dict]]:
-    """Fetch a single page of assets. Returns (search_from, assets) tuple."""
+    """Fetch a single page of assets."""
     payload = {
         "request_data": {
             "assessment_profile_revision": anchor["assessment_profile_revision"],
@@ -443,16 +573,15 @@ def fetch_asset_page(client: CortexAPIClient, anchor: dict, search_from: int, pa
     
     try:
         response = client.post("/public_api/v1/compliance/get_assets", payload)
-        reply = response.get("reply", {})
-        assets = reply.get("assets", [])
+        assets = response.get("reply", {}).get("assets", [])
         return (search_from, assets)
     except Exception as e:
-        print(f"      ⚠ Error fetching page at {search_from}: {e}")
+        out.debug_msg(f"Error fetching page at {search_from}: {e}")
         return (search_from, [])
 
 
 def get_total_asset_count(client: CortexAPIClient, anchor: dict) -> int:
-    """Get total count of assets for an anchor (single request)."""
+    """Get total count of assets for an anchor."""
     payload = {
         "request_data": {
             "assessment_profile_revision": anchor["assessment_profile_revision"],
@@ -461,7 +590,7 @@ def get_total_asset_count(client: CortexAPIClient, anchor: dict) -> int:
                 {"field": "status", "operator": "neq", "value": "Not Assessed"}
             ],
             "search_from": 0,
-            "search_to": 1  # Just need count, not actual assets
+            "search_to": 1
         }
     }
     
@@ -473,55 +602,39 @@ def get_paginated_assets_parallel(
     client: CortexAPIClient, 
     anchor: dict, 
     page_size: int,
-    parallel_workers: int = 10
+    parallel_workers: int,
+    progress=None,
+    task_id=None
 ) -> Tuple[List[dict], int]:
     """Fetch all assets for an anchor using parallel requests."""
     
-    # First, get total count
     total_count = get_total_asset_count(client, anchor)
     if total_count == 0:
         return [], 0
     
-    print(f"    Total assets to fetch: {total_count:,}")
-    
-    # Calculate all page offsets
     page_offsets = list(range(0, total_count, page_size))
     total_pages = len(page_offsets)
     
-    print(f"    Pages to fetch: {total_pages:,} (using {parallel_workers} parallel workers)")
+    out.debug_msg(f"Total: {total_count:,} assets, {total_pages:,} pages")
     
-    # Fetch all pages in parallel
     all_assets = []
-    completed = 0
-    start_time = time.time()
     
     with ThreadPoolExecutor(max_workers=parallel_workers) as executor:
-        # Submit all page fetches
         futures = {
             executor.submit(fetch_asset_page, client, anchor, offset, page_size): offset 
             for offset in page_offsets
         }
         
-        # Collect results as they complete
         for future in as_completed(futures):
-            completed += 1
-            search_from, assets = future.result()
+            _, assets = future.result()
             all_assets.extend(assets)
-            
-            # Progress update every 50 pages or at end
-            if completed % 50 == 0 or completed == total_pages:
-                elapsed = time.time() - start_time
-                rate = completed / elapsed if elapsed > 0 else 0
-                pct = (completed / total_pages) * 100
-                print(f"      Progress: {completed:,}/{total_pages:,} pages ({pct:.1f}%) - {len(all_assets):,} assets - {rate:.1f} pages/sec")
-    
-    elapsed = time.time() - start_time
-    print(f"    ✓ Fetched {len(all_assets):,} assets in {elapsed:.1f}s ({len(all_assets)/elapsed:.0f} assets/sec)")
+            if progress and task_id is not None:
+                progress.update(task_id, advance=1)
     
     return all_assets, total_count
 
 
-def enrich_assets(raw_assets: List[dict], anchor: dict, controls_lookup: Dict[str, dict]) -> List[dict]:
+def enrich_assets(raw_assets: List[dict], anchor: dict, controls_lookup: Dict[str, dict]) -> Tuple[List[dict], int, int]:
     """Enrich raw assets with control data."""
     profile_name = anchor["profile_name"]
     standard_name = anchor["standard_name"]
@@ -573,44 +686,7 @@ def enrich_assets(raw_assets: List[dict], anchor: dict, controls_lookup: Dict[st
             "SCANNABLE_ASSET_TYPES": json.dumps(control_data.get("scannable_asset_types", []))
         })
     
-    print(f"    Enrichment: {matched} matched, {unmatched} unmatched")
-    return enriched
-
-
-def fetch_assets_for_anchor(
-    client: CortexAPIClient, 
-    anchor: dict, 
-    controls_catalog: Dict[str, dict],
-    page_size: int,
-    parallel_workers: int = 10
-) -> List[dict]:
-    """Fetch and enrich all assets for an anchor using parallel requests."""
-    profile_name = anchor["profile_name"]
-    standard_name = anchor["standard_name"]
-    
-    print(f"\n  Processing: {profile_name} / {standard_name[:40]}...")
-    
-    # Get controls for this standard
-    standard_data = controls_catalog.get(standard_name, {})
-    controls = standard_data.get("controls", [])
-    
-    if not controls:
-        print(f"    ⚠ No controls found for standard")
-        return []
-    
-    # Build controls lookup by revision
-    controls_lookup = {str(c.get("revision")): c for c in controls}
-    print(f"    Controls lookup: {len(controls_lookup)} entries")
-    
-    # Fetch all assets in parallel
-    raw_assets, total_count = get_paginated_assets_parallel(
-        client, anchor, page_size, parallel_workers
-    )
-    
-    # Enrich assets
-    enriched = enrich_assets(raw_assets, anchor, controls_lookup)
-    
-    return enriched
+    return enriched, matched, unmatched
 
 
 def fetch_all_assets(
@@ -620,84 +696,101 @@ def fetch_all_assets(
     config: Config
 ) -> Dict[str, List[dict]]:
     """Fetch assets for all anchors using parallel requests."""
-    print("\n" + "="*60)
-    print("STAGE 3: Fetching Assets (Parallel)")
-    print("="*60)
+    out.header("Stage 3: Fetching Assets")
     
-    # Limit anchors if configured
     if config.MAX_ANCHORS > 0 and len(anchors) > config.MAX_ANCHORS:
         anchors = anchors[:config.MAX_ANCHORS]
-        print(f"Limiting to {config.MAX_ANCHORS} anchor(s)")
+        out.debug_msg(f"Limiting to {config.MAX_ANCHORS} anchor(s)")
     
-    # =========================================================================
-    # PRE-FLIGHT: Get asset counts for all anchors
-    # =========================================================================
-    print("\n--- Pre-flight: Counting assets for each anchor ---\n")
+    # Pre-flight: Get counts for all anchors
+    out.debug_msg("Pre-flight: Counting assets...")
     
     anchor_counts = []
     total_assets_all = 0
     total_pages_all = 0
     
-    for i, anchor in enumerate(anchors):
-        profile = anchor['profile_name']
-        standard = anchor['standard_name']
-        
-        # Get count for this anchor
+    for anchor in anchors:
         count = get_total_asset_count(client, anchor)
         pages = (count + config.PAGE_SIZE - 1) // config.PAGE_SIZE if count > 0 else 0
-        
         anchor_counts.append({
-            "index": i + 1,
-            "profile": profile,
-            "standard": standard[:50],
+            "profile": anchor['profile_name'],
+            "standard": anchor['standard_name'][:40],
             "assets": count,
             "pages": pages
         })
-        
         total_assets_all += count
         total_pages_all += pages
-        
-        print(f"  [{i+1}] {profile[:30]:30} | {count:>10,} assets | {pages:>6,} pages")
     
-    # Summary
-    print("\n" + "-"*60)
-    print(f"  TOTAL: {total_assets_all:,} assets across {total_pages_all:,} API requests")
-    print(f"  Workers: {config.PARALLEL_WORKERS}")
+    # Show pre-flight table
+    rows = []
+    for i, ac in enumerate(anchor_counts):
+        rows.append([str(i+1), ac['profile'][:25], f"{ac['assets']:,}", f"{ac['pages']:,}"])
     
-    # Estimate time (assuming ~10 requests/sec with parallel workers)
-    est_rate = config.PARALLEL_WORKERS * 2  # ~2 req/sec per worker
-    est_seconds = total_pages_all / est_rate if est_rate > 0 else 0
-    est_minutes = est_seconds / 60
-    print(f"  Estimated time: ~{est_minutes:.0f} minutes ({est_seconds:.0f} seconds)")
-    print("-"*60 + "\n")
+    out.table(
+        "Pre-flight Summary",
+        ["#", "Profile", "Assets", "Pages"],
+        rows
+    )
     
-    # =========================================================================
-    # FETCH: Now fetch assets for each anchor
-    # =========================================================================
+    est_rate = config.PARALLEL_WORKERS * 2
+    est_minutes = (total_pages_all / est_rate / 60) if est_rate > 0 else 0
+    out.info(f"Total: [cyan]{total_assets_all:,}[/cyan] assets • [cyan]{total_pages_all:,}[/cyan] API calls • ~[cyan]{est_minutes:.0f}[/cyan] min")
+    
+    # Fetch assets
     all_assets = {}
     total_fetched = 0
     
-    for i, anchor in enumerate(anchors):
-        print(f"\nAnchor {i+1}/{len(anchors)}:")
-        pair_key = f"{anchor['profile_name']}|{anchor['standard_name']}"
-        
-        assets = fetch_assets_for_anchor(
-            client, anchor, controls_catalog, 
-            config.PAGE_SIZE, config.PARALLEL_WORKERS
-        )
-        all_assets[pair_key] = assets
-        total_fetched += len(assets)
+    if RICH_AVAILABLE:
+        with create_progress() as progress:
+            for i, anchor in enumerate(anchors):
+                pair_key = f"{anchor['profile_name']}|{anchor['standard_name']}"
+                
+                standard_data = controls_catalog.get(anchor['standard_name'], {})
+                controls = standard_data.get("controls", [])
+                controls_lookup = {str(c.get("revision")): c for c in controls}
+                
+                total_count = anchor_counts[i]["assets"]
+                total_pages = anchor_counts[i]["pages"]
+                
+                task_desc = f"[{i+1}/{len(anchors)}] {anchor['profile_name'][:30]}"
+                task = progress.add_task(task_desc, total=total_pages)
+                
+                raw_assets, _ = get_paginated_assets_parallel(
+                    client, anchor, config.PAGE_SIZE, config.PARALLEL_WORKERS, progress, task
+                )
+                
+                enriched, matched, unmatched = enrich_assets(raw_assets, anchor, controls_lookup)
+                out.debug_msg(f"Enrichment: {matched} matched, {unmatched} unmatched")
+                
+                all_assets[pair_key] = enriched
+                total_fetched += len(enriched)
+    else:
+        for i, anchor in enumerate(anchors):
+            pair_key = f"{anchor['profile_name']}|{anchor['standard_name']}"
+            out.info(f"[{i+1}/{len(anchors)}] {anchor['profile_name']}")
+            
+            standard_data = controls_catalog.get(anchor['standard_name'], {})
+            controls = standard_data.get("controls", [])
+            controls_lookup = {str(c.get("revision")): c for c in controls}
+            
+            raw_assets, _ = get_paginated_assets_parallel(
+                client, anchor, config.PAGE_SIZE, config.PARALLEL_WORKERS
+            )
+            
+            enriched, matched, unmatched = enrich_assets(raw_assets, anchor, controls_lookup)
+            all_assets[pair_key] = enriched
+            total_fetched += len(enriched)
     
-    print(f"\n✓ Total assets fetched: {total_fetched:,}")
+    out.success(f"Total assets fetched: {total_fetched:,}")
     return all_assets
 
 
 # =============================================================================
-# PUSH TO COLLECTOR
+# STAGE 4-7: OUTPUTS AND PUSH
 # =============================================================================
 
 def save_records_to_ndjson(records: List[dict], output_path: Path) -> int:
-    """Save records as NDJSON format (collector-ready)."""
+    """Save records as NDJSON format."""
     with open(output_path, 'w', encoding='utf-8') as f:
         for record in records:
             f.write(json.dumps(record, default=str) + "\n")
@@ -705,206 +798,145 @@ def save_records_to_ndjson(records: List[dict], output_path: Path) -> int:
 
 
 def print_curl_command(file_path: Path, collector_url: str, api_key_env_var: str):
-    """Print a curl command to push the saved file manually."""
-    print(f"\n  To push manually, run:")
-    print(f"  curl -X POST \"{collector_url}\" \\")
-    print(f"    -H \"Authorization: ${api_key_env_var}\" \\")
-    print(f"    -H \"Content-Type: text/plain\" \\")
-    print(f"    --data-binary @{file_path}\n")
+    """Print curl command for manual push."""
+    out.info(f"\n  [dim]To push manually:[/dim]")
+    out.info(f"  [dim]curl -X POST \"{collector_url}\" \\[/dim]")
+    out.info(f"  [dim]  -H \"Authorization: ${api_key_env_var}\" \\[/dim]")
+    out.info(f"  [dim]  -H \"Content-Type: text/plain\" \\[/dim]")
+    out.info(f"  [dim]  --data-binary @{file_path}[/dim]\n")
 
-
-def push_to_collector(
-    records: List[dict],
-    collector_url: str,
-    api_key: str,
-    batch_size: int,
-    dry_run: bool,
-    label: str = "Record"
-) -> dict:
-    """Push records to HTTP Collector in NDJSON format."""
-    if not records:
-        return {"pushed": 0, "batches": 0}
-    
-    if not collector_url or not api_key:
-        print(f"    ⚠ Skipping push ({label}): No collector URL or API key")
-        return {"pushed": 0, "batches": 0, "skipped": True}
-    
-    if dry_run:
-        print(f"    [DRY RUN] Would push {len(records)} {label}(s) to collector")
-        return {"pushed": len(records), "batches": (len(records) + batch_size - 1) // batch_size, "dry_run": True}
-    
-    headers = {
-        "Authorization": api_key,
-        "Content-Type": "text/plain"
-    }
-    
-    total_pushed = 0
-    total_batches = 0
-    
-    for i in range(0, len(records), batch_size):
-        batch = records[i:i + batch_size]
-        # NDJSON format: one JSON object per line
-        ndjson_body = "\n".join(json.dumps(r, default=str) for r in batch)
-        
-        try:
-            response = requests.post(
-                collector_url,
-                headers=headers,
-                data=ndjson_body,
-                timeout=120
-            )
-            response.raise_for_status()
-            total_pushed += len(batch)
-            total_batches += 1
-            print(f"    Pushed batch {total_batches}: {len(batch)} {label}(s)")
-        except requests.exceptions.RequestException as e:
-            print(f"    ❌ Failed to push batch: {e}")
-    
-    print(f"    ✓ Total pushed: {total_pushed} {label}(s) in {total_batches} batch(es)")
-    return {"pushed": total_pushed, "batches": total_batches}
-
-
-# =============================================================================
-# OUTPUT
-# =============================================================================
 
 def save_assets_to_csv(assets: List[dict], output_path: Path):
-    """Save assets to a CSV file."""
+    """Save assets to CSV."""
     if not assets:
         return
-    
     with open(output_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=assets[0].keys())
         writer.writeheader()
         writer.writerows(assets)
-    
-    print(f"  ✓ Saved: {output_path.name}")
+    out.debug_msg(f"Saved: {output_path.name}")
 
 
-def save_all_outputs(
-    all_assets: Dict[str, List[dict]],
-    controls_catalog: Dict[str, dict],
-    anchors: List[dict],
-    config: Config
-):
+def save_all_outputs(all_assets: Dict[str, List[dict]], controls_catalog: Dict[str, dict], anchors: List[dict], config: Config, timestamp: str):
     """Save all outputs to files."""
-    print("\n" + "="*60)
-    print("STAGE 4: Saving Outputs")
-    print("="*60)
+    out.header("Stage 4: Saving Outputs")
     
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Save assets CSVs
     for pair_key, assets in all_assets.items():
         if assets:
             safe_name = pair_key.replace("|", "_").replace(" ", "_")[:50]
             csv_path = config.OUTPUT_DIR / f"assets_{safe_name}_{timestamp}.csv"
             save_assets_to_csv(assets, csv_path)
     
-    # Save controls catalog JSON
     catalog_path = config.OUTPUT_DIR / f"controls_catalog_{timestamp}.json"
     with open(catalog_path, 'w', encoding='utf-8') as f:
         json.dump(controls_catalog, f, indent=2)
-    print(f"  ✓ Saved: {catalog_path.name}")
+    out.debug_msg(f"Saved: {catalog_path.name}")
     
-    # Save anchors JSON
     anchors_path = config.OUTPUT_DIR / f"anchors_{timestamp}.json"
     with open(anchors_path, 'w', encoding='utf-8') as f:
         json.dump(anchors, f, indent=2)
-    print(f"  ✓ Saved: {anchors_path.name}")
+    out.debug_msg(f"Saved: {anchors_path.name}")
     
-    # Save summary JSON
     summary = {
         "timestamp": timestamp,
         "total_anchors": len(anchors),
         "total_standards": len(controls_catalog),
         "total_controls": sum(c["total_controls"] for c in controls_catalog.values()),
         "total_assets": sum(len(a) for a in all_assets.values()),
-        "pairs": [
-            {
-                "pair": k,
-                "assets": len(v)
-            }
-            for k, v in all_assets.items()
-        ]
     }
     summary_path = config.OUTPUT_DIR / f"summary_{timestamp}.json"
     with open(summary_path, 'w', encoding='utf-8') as f:
         json.dump(summary, f, indent=2)
-    print(f"  ✓ Saved: {summary_path.name}")
+    out.debug_msg(f"Saved: {summary_path.name}")
     
+    out.success(f"Outputs saved to {config.OUTPUT_DIR}")
     return summary
 
 
-def push_assets_to_collector(all_assets: Dict[str, List[dict]], config: Config, timestamp: str) -> dict:
-    """Push all assets to HTTP Collector using COMPLIANCE_API_KEY."""
-    print("\n" + "="*60)
-    print("STAGE 5: Push Assets to HTTP Collector")
-    print("="*60)
+def push_to_collector(records: List[dict], collector_url: str, api_key: str, batch_size: int, dry_run: bool, label: str = "Record", progress=None) -> dict:
+    """Push records to HTTP Collector."""
+    if not records:
+        return {"pushed": 0, "batches": 0}
     
-    # Flatten all assets into single list
+    if not collector_url or not api_key:
+        return {"pushed": 0, "batches": 0, "skipped": True}
+    
+    if dry_run:
+        out.debug_msg(f"[DRY RUN] Would push {len(records)} {label}(s)")
+        return {"pushed": len(records), "batches": (len(records) + batch_size - 1) // batch_size, "dry_run": True}
+    
+    headers = {"Authorization": api_key, "Content-Type": "text/plain"}
+    total_pushed = 0
+    total_batches = (len(records) + batch_size - 1) // batch_size
+    
+    if RICH_AVAILABLE and progress is None:
+        with create_progress() as prog:
+            task = prog.add_task(f"Pushing {label}s", total=total_batches)
+            for i in range(0, len(records), batch_size):
+                batch = records[i:i + batch_size]
+                ndjson_body = "\n".join(json.dumps(r, default=str) for r in batch)
+                try:
+                    response = requests.post(collector_url, headers=headers, data=ndjson_body, timeout=120)
+                    response.raise_for_status()
+                    total_pushed += len(batch)
+                except requests.exceptions.RequestException as e:
+                    out.error(f"Failed to push batch: {e}")
+                prog.update(task, advance=1)
+    else:
+        for i in range(0, len(records), batch_size):
+            batch = records[i:i + batch_size]
+            ndjson_body = "\n".join(json.dumps(r, default=str) for r in batch)
+            try:
+                response = requests.post(collector_url, headers=headers, data=ndjson_body, timeout=120)
+                response.raise_for_status()
+                total_pushed += len(batch)
+            except requests.exceptions.RequestException as e:
+                out.error(f"Failed to push batch: {e}")
+    
+    return {"pushed": total_pushed, "batches": total_batches}
+
+
+def push_assets_to_collector(all_assets: Dict[str, List[dict]], config: Config, timestamp: str) -> dict:
+    """Push assets to HTTP Collector."""
+    out.header("Stage 5: Push Assets to Collector")
+    
     all_records = []
     for assets in all_assets.values():
         all_records.extend(assets)
     
     if not all_records:
-        print("⚠ No assets to push")
+        out.warning("No assets to push")
         return {"assets_pushed": 0, "skipped": True}
     
-    print(f"Total asset records: {len(all_records):,}")
-    
-    # Save to NDJSON file (collector-ready format)
     ndjson_path = config.OUTPUT_DIR / f"assets_collector_{timestamp}.json"
     save_records_to_ndjson(all_records, ndjson_path)
-    print(f"  ✓ Saved: {ndjson_path.name} ({len(all_records):,} records)")
+    out.success(f"Saved: {ndjson_path.name} ({len(all_records):,} records)")
     
-    # Print curl command for manual push
     if config.COLLECTOR_URL:
         print_curl_command(ndjson_path, config.COLLECTOR_URL, "COMPLIANCE_API_KEY")
     
-    # Check if we should push
     if not config.COLLECTOR_URL:
-        print("⚠ Skipping push: No collector URL configured")
+        out.debug_msg("Skipping push: No collector URL")
         return {"assets_pushed": 0, "skipped": True, "saved_file": str(ndjson_path)}
     
     if not config.COMPLIANCE_API_KEY:
-        print("⚠ Skipping push: No COMPLIANCE_API_KEY configured")
+        out.debug_msg("Skipping push: No COMPLIANCE_API_KEY")
         return {"assets_pushed": 0, "skipped": True, "saved_file": str(ndjson_path)}
     
-    print(f"Dry run mode: {config.DRY_RUN}")
-    
     result = push_to_collector(
-        records=all_records,
-        collector_url=config.COLLECTOR_URL,
-        api_key=config.COMPLIANCE_API_KEY,
-        batch_size=config.BATCH_SIZE,
-        dry_run=config.DRY_RUN,
-        label="Asset"
+        all_records, config.COLLECTOR_URL, config.COMPLIANCE_API_KEY,
+        config.BATCH_SIZE, config.DRY_RUN, "Asset"
     )
+    
+    status = "dry run" if result.get("dry_run") else f"{result.get('pushed', 0):,} pushed"
+    out.success(f"Assets: {status}")
     
     return {"assets_pushed": result.get("pushed", 0), "saved_file": str(ndjson_path), **result}
 
 
-# =============================================================================
-# STAGE 6: CREATE CONTROL SUMMARY
-# =============================================================================
-
-def create_control_summary(
-    all_assets: Dict[str, List[dict]],
-    controls_catalog: Dict[str, dict],
-    anchors: List[dict]
-) -> List[dict]:
-    """
-    Create per-control summary records from asset data.
-    
-    For each control, calculates:
-    - OVERALL_STATUS: FAILED > PASSED > NOT_ASSESSED > NOT_EVALUATED
-    - SCORE: PASSED / (PASSED + FAILED) for evaluated assets
-    - Counts of PASSED, FAILED, NOT_ASSESSED assets
-    """
-    print("\n" + "="*60)
-    print("STAGE 6: Creating Control Summaries")
-    print("="*60)
+def create_control_summary(all_assets: Dict[str, List[dict]], controls_catalog: Dict[str, dict], anchors: List[dict]) -> List[dict]:
+    """Create per-control summary records."""
+    out.header("Stage 6: Creating Control Summaries")
     
     all_summaries = []
     
@@ -913,23 +945,17 @@ def create_control_summary(
         standard_name = anchor["standard_name"]
         pair_key = f"{profile_name}|{standard_name}"
         
-        print(f"\n  Processing: {profile_name} / {standard_name[:40]}...")
+        out.debug_msg(f"Processing: {profile_name} / {standard_name[:40]}...")
         
-        # Get assets for this pair
         assets = all_assets.get(pair_key, [])
-        
-        # Get controls for this standard
         standard_data = controls_catalog.get(standard_name, {})
         controls = standard_data.get("controls", [])
         
         if not controls:
-            print(f"    ⚠ No controls found for standard")
             continue
         
-        # Build controls lookup by revision
         controls_lookup = {str(c.get("revision")): c for c in controls}
         
-        # Group assets by control revision
         assets_by_control = {}
         for asset in assets:
             revision = asset.get("CONTROL_REVISION", str(asset.get("CONTROL_REVISION_ID", "")))
@@ -937,7 +963,6 @@ def create_control_summary(
                 assets_by_control[revision] = []
             assets_by_control[revision].append(asset)
         
-        # Create summary for each control
         eval_datetime = anchor.get("last_evaluation_time")
         eval_datetime_str = datetime.fromtimestamp(eval_datetime / 1000).isoformat() if eval_datetime else None
         
@@ -945,7 +970,6 @@ def create_control_summary(
             revision = str(control.get("revision"))
             control_assets = assets_by_control.get(revision, [])
             
-            # Count statuses
             status_counts = {"PASSED": 0, "FAILED": 0, "NOT_ASSESSED": 0}
             for asset in control_assets:
                 status = asset.get("STATUS", "").upper()
@@ -957,7 +981,6 @@ def create_control_summary(
             not_assessed = status_counts["NOT_ASSESSED"]
             total = passed + failed + not_assessed
             
-            # Determine overall status (priority: FAILED > PASSED > NOT_ASSESSED > NOT_EVALUATED)
             if failed > 0:
                 overall_status = "FAILED"
             elif passed > 0:
@@ -967,13 +990,9 @@ def create_control_summary(
             else:
                 overall_status = "NOT_EVALUATED"
             
-            # Calculate score (PASSED / (PASSED + FAILED))
-            score = 0.0
-            if passed + failed > 0:
-                score = passed / (passed + failed)
+            score = passed / (passed + failed) if (passed + failed) > 0 else 0.0
             
-            # Create summary record
-            summary_record = {
+            all_summaries.append({
                 "STANDARD_NAME": standard_name,
                 "ASSESSMENT_PROFILE_NAME": profile_name,
                 "ASSESSMENT_PROFILE_REVISION": anchor.get("assessment_profile_revision"),
@@ -992,82 +1011,42 @@ def create_control_summary(
                 "FAILED_COUNT": failed,
                 "NOT_ASSESSED_COUNT": not_assessed,
                 "TOTAL_ASSETS": total
-            }
-            
-            all_summaries.append(summary_record)
-        
-        # Print stats for this pair
-        pair_summaries = [s for s in all_summaries if s["ASSESSMENT_PROFILE_NAME"] == profile_name and s["STANDARD_NAME"] == standard_name]
-        status_dist = {}
-        for s in pair_summaries:
-            status_dist[s["STATUS"]] = status_dist.get(s["STATUS"], 0) + 1
-        
-        print(f"    Controls: {len(pair_summaries)}")
-        print(f"    Status distribution: {status_dist}")
-        
-        # Calculate average score for evaluated controls
-        evaluated = [s for s in pair_summaries if s["STATUS"] in ("PASSED", "FAILED")]
-        if evaluated:
-            avg_score = sum(s["SCORE"] for s in evaluated) / len(evaluated)
-            print(f"    Average score: {avg_score:.2%}")
+            })
     
-    print(f"\n✓ Total control summaries: {len(all_summaries)}")
+    out.success(f"Total summaries: {len(all_summaries)}")
     return all_summaries
 
 
-def save_summaries_to_csv(summaries: List[dict], output_path: Path):
-    """Save control summaries to a CSV file."""
-    if not summaries:
-        return
-    
-    with open(output_path, 'w', newline='', encoding='utf-8') as f:
-        writer = csv.DictWriter(f, fieldnames=summaries[0].keys())
-        writer.writeheader()
-        writer.writerows(summaries)
-    
-    print(f"  ✓ Saved: {output_path.name}")
-
-
 def push_summaries_to_collector(summaries: List[dict], config: Config, timestamp: str) -> dict:
-    """Push control summaries to HTTP Collector using CONTROLS_API_KEY."""
-    print("\n" + "="*60)
-    print("STAGE 7: Push Summaries to HTTP Collector")
-    print("="*60)
+    """Push summaries to HTTP Collector."""
+    out.header("Stage 7: Push Summaries to Collector")
     
     if not summaries:
-        print("⚠ No summaries to push")
+        out.warning("No summaries to push")
         return {"summaries_pushed": 0, "skipped": True}
     
-    print(f"Total summary records: {len(summaries):,}")
-    
-    # Save to NDJSON file (collector-ready format)
     ndjson_path = config.OUTPUT_DIR / f"summaries_collector_{timestamp}.json"
     save_records_to_ndjson(summaries, ndjson_path)
-    print(f"  ✓ Saved: {ndjson_path.name} ({len(summaries):,} records)")
+    out.success(f"Saved: {ndjson_path.name} ({len(summaries):,} records)")
     
-    # Print curl command for manual push
     if config.COLLECTOR_URL:
         print_curl_command(ndjson_path, config.COLLECTOR_URL, "CONTROLS_API_KEY")
     
-    # Check if we should push
     if not config.COLLECTOR_URL:
-        print("⚠ Skipping push: No collector URL configured")
+        out.debug_msg("Skipping push: No collector URL")
         return {"summaries_pushed": 0, "skipped": True, "saved_file": str(ndjson_path)}
     
     if not config.CONTROLS_API_KEY:
-        print("⚠ Skipping push: No CONTROLS_API_KEY configured")
+        out.debug_msg("Skipping push: No CONTROLS_API_KEY")
         return {"summaries_pushed": 0, "skipped": True, "saved_file": str(ndjson_path)}
     
-    print(f"Dry run mode: {config.DRY_RUN}")
-    
     result = push_to_collector(
-        records=summaries,
-        collector_url=config.COLLECTOR_URL,
-        api_key=config.CONTROLS_API_KEY,
-        batch_size=config.BATCH_SIZE,
-        dry_run=config.DRY_RUN,
-        label="Summary"
+        summaries, config.COLLECTOR_URL, config.CONTROLS_API_KEY,
+        config.BATCH_SIZE, config.DRY_RUN, "Summary"
     )
+    
+    status = "dry run" if result.get("dry_run") else f"{result.get('pushed', 0):,} pushed"
+    out.success(f"Summaries: {status}")
     
     return {"summaries_pushed": result.get("pushed", 0), "saved_file": str(ndjson_path), **result}
 
@@ -1076,15 +1055,60 @@ def push_summaries_to_collector(summaries: List[dict], config: Config, timestamp
 # MAIN
 # =============================================================================
 
+def parse_args():
+    """Parse command line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Cortex Cloud Compliance Data Fetcher",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python local_compliance_fetcher.py              # Normal mode
+  python local_compliance_fetcher.py --debug      # Verbose output
+  python local_compliance_fetcher.py --dry-run    # Don't push to collector
+        """
+    )
+    parser.add_argument(
+        "--debug", "-d",
+        action="store_true",
+        help="Enable verbose debug output (show retries, API details)"
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Don't push to collector (overrides config)"
+    )
+    return parser.parse_args()
+
+
 def main():
-    print("\n" + "="*60)
-    print("  Cortex Cloud Compliance Data Fetcher (Local)")
-    print("="*60)
+    global out
+    
+    # Parse arguments
+    args = parse_args()
+    
+    # Initialize output manager
+    out = Output(debug=args.debug)
+    
+    # Title
+    if RICH_AVAILABLE:
+        out.console.print()
+        out.console.print(Panel.fit(
+            "[bold]Cortex Cloud Compliance Data Fetcher[/bold]" + 
+            ("\n[dim]DEBUG MODE[/dim]" if args.debug else ""),
+            border_style="cyan"
+        ))
+    else:
+        print("\n" + "="*60)
+        print("  Cortex Cloud Compliance Data Fetcher")
+        if args.debug:
+            print("  DEBUG MODE")
+        print("="*60)
     
     start_time = time.time()
     
     # Load configuration
-    config = Config()
+    dry_run_override = True if args.dry_run else None
+    config = Config(dry_run_override=dry_run_override)
     
     # Create API client
     client = CortexAPIClient(config)
@@ -1092,7 +1116,7 @@ def main():
     # Stage 1: Get anchors
     anchors = get_all_anchors(client, config.ASSESSMENTS)
     if not anchors:
-        print("\n❌ No anchors found. Check your assessments configuration.")
+        out.error("No anchors found. Check your assessments configuration.")
         return 1
     
     # Stage 2: Get controls catalog
@@ -1101,60 +1125,53 @@ def main():
     # Stage 3: Fetch assets
     all_assets = fetch_all_assets(client, anchors, controls_catalog, config)
     
-    # Generate timestamp for all output files
+    # Generate timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
-    # Stage 4: Save outputs to files
-    summary = save_all_outputs(all_assets, controls_catalog, anchors, config)
+    # Stage 4: Save outputs
+    summary = save_all_outputs(all_assets, controls_catalog, anchors, config, timestamp)
     
-    # Stage 5: Push ASSETS to HTTP Collector (COMPLIANCE_API_KEY)
-    assets_push_result = push_assets_to_collector(all_assets, config, timestamp)
-    summary["assets_push_result"] = assets_push_result
+    # Stage 5: Push assets
+    assets_push = push_assets_to_collector(all_assets, config, timestamp)
     
-    # Stage 6: Create Control Summaries
+    # Stage 6: Create summaries
     control_summaries = create_control_summary(all_assets, controls_catalog, anchors)
-    summary["total_summaries"] = len(control_summaries)
     
-    # Save summaries to CSV
+    # Save summaries CSV
     if control_summaries:
         summaries_path = config.OUTPUT_DIR / f"control_summaries_{timestamp}.csv"
-        save_summaries_to_csv(control_summaries, summaries_path)
+        with open(summaries_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=control_summaries[0].keys())
+            writer.writeheader()
+            writer.writerows(control_summaries)
+        out.debug_msg(f"Saved: {summaries_path.name}")
     
-    # Stage 7: Push SUMMARIES to HTTP Collector (CONTROLS_API_KEY)
-    summaries_push_result = push_summaries_to_collector(control_summaries, config, timestamp)
-    summary["summaries_push_result"] = summaries_push_result
+    # Stage 7: Push summaries
+    summaries_push = push_summaries_to_collector(control_summaries, config, timestamp)
     
-    # Print final summary
+    # Final summary
     elapsed = time.time() - start_time
-    print("\n" + "="*60)
-    print("  COMPLETE")
-    print("="*60)
-    print(f"  Total time: {elapsed:.1f} seconds")
-    print(f"  Anchors processed: {summary['total_anchors']}")
-    print(f"  Controls fetched: {summary['total_controls']}")
-    print(f"  Assets fetched: {summary['total_assets']}")
-    print(f"  Control summaries: {summary['total_summaries']}")
-    print(f"  Output directory: {config.OUTPUT_DIR}")
     
-    # Assets push results
-    apr = assets_push_result
-    if apr.get("skipped"):
-        print(f"  Assets push: skipped (not configured)")
-    elif apr.get("dry_run"):
-        print(f"  Assets push: {apr.get('assets_pushed', 0):,} records (DRY RUN)")
-    else:
-        print(f"  Assets push: {apr.get('assets_pushed', 0):,} records pushed")
+    # Determine push status strings
+    def push_status(result):
+        if result.get("skipped"):
+            return "skipped"
+        elif result.get("dry_run"):
+            return f"{result.get('pushed', 0):,} (dry run)"
+        else:
+            return f"{result.get('pushed', 0):,} pushed"
     
-    # Summaries push results
-    spr = summaries_push_result
-    if spr.get("skipped"):
-        print(f"  Summaries push: skipped (not configured)")
-    elif spr.get("dry_run"):
-        print(f"  Summaries push: {spr.get('summaries_pushed', 0):,} records (DRY RUN)")
-    else:
-        print(f"  Summaries push: {spr.get('summaries_pushed', 0):,} records pushed")
+    stats = {
+        "anchors": len(anchors),
+        "controls": summary.get("total_controls", 0),
+        "assets": summary.get("total_assets", 0),
+        "summaries": len(control_summaries),
+        "assets_push": push_status(assets_push),
+        "summaries_push": push_status(summaries_push)
+    }
     
-    print("="*60 + "\n")
+    out.final_summary(stats, elapsed)
+    out.info(f"Output directory: [cyan]{config.OUTPUT_DIR}[/cyan]")
     
     return 0
 
