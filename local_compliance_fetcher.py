@@ -21,6 +21,8 @@ import sys
 import time
 import csv
 import random
+import threading
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -166,6 +168,10 @@ class Output:
 # Global output instance
 out: Output = None
 
+# TEMP DEBUG BLOCK START (remove when Postman validation is done)
+_payload_dump_lock = threading.Lock()
+# TEMP DEBUG BLOCK END
+
 
 # =============================================================================
 # PROGRESS BARS
@@ -233,10 +239,27 @@ class Config:
             self.DRY_RUN = dry_run_override
         self.MAX_ANCHORS = int(os.getenv("MAX_ANCHORS", "0"))
         self.PARALLEL_WORKERS = int(os.getenv("PARALLEL_WORKERS", "5"))
+        # Pre-flight ETA model: one parallel "wave" (up to PARALLEL_WORKERS page calls)
+        # takes this many seconds on average.
+        self.EST_API_WAVE_SECONDS = float(os.getenv("EST_API_WAVE_SECONDS", "7.0"))
         
         # Output options
         self.OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "./output"))
         self.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        
+        # Dedup (validation) options
+        # When enabled, the script will query Cortex datasets to avoid re-pushing
+        # the same assessment revision multiple times.
+        self.DEDUP_ENABLED = os.getenv("DEDUP_ENABLED", "true").lower() == "true"
+        self.DEDUP_TIMEFRAME_DAYS = int(os.getenv("DEDUP_TIMEFRAME_DAYS", "30"))
+        self.ASSETS_DATASET_NAME = os.getenv("ASSETS_DATASET_NAME", "panw_compliance_assets_raw")
+        self.SUMMARY_DATASET_NAME = os.getenv("SUMMARY_DATASET_NAME", "panw_compliance_summary_raw")
+
+        # TEMP DEBUG BLOCK START (remove when Postman validation is done)
+        self.DUMP_GET_ASSETS_PAYLOAD = os.getenv("DUMP_GET_ASSETS_PAYLOAD", "false").lower() == "true"
+        self.DUMP_GET_ASSETS_PAYLOAD_FILE = os.getenv("DUMP_GET_ASSETS_PAYLOAD_FILE", "")
+        self.DUMP_GET_ASSETS_CURL = os.getenv("DUMP_GET_ASSETS_CURL", "false").lower() == "true"
+        # TEMP DEBUG BLOCK END
         
         self.validate()
     
@@ -287,10 +310,11 @@ class CortexAPIClient:
         self.session = requests.Session()
         self.session.headers.update(self.headers)
     
-    def post(self, endpoint: str, body: dict, timeout: int = 120) -> dict:
+    def post(self, endpoint: str, body: dict, timeout: int = 120, request_context: str = "") -> dict:
         """Make a POST request with automatic retry on transient errors."""
         url = f"{self.base_url}{endpoint}"
         last_exception = None
+        endpoint_display = f"{endpoint} [{request_context}]" if request_context else endpoint
         
         for attempt in range(self.MAX_RETRIES + 1):
             try:
@@ -308,10 +332,12 @@ class CortexAPIClient:
                 last_exception = e
                 
             except requests.exceptions.HTTPError as e:
-                if e.response is not None and e.response.status_code not in self.RETRYABLE_STATUS_CODES:
-                    out.error(f"HTTP Error: {e}")
-                    out.debug_msg(f"Response: {e.response.text[:500]}")
-                    raise
+                if e.response is not None:
+                    out.debug_msg(f"HTTP error on {endpoint_display} (status {e.response.status_code})")
+                    out.debug_msg(f"Raw response: {e.response.text[:2000]}")
+                    if e.response.status_code not in self.RETRYABLE_STATUS_CODES:
+                        out.error(f"HTTP Error: {e}")
+                        raise
                 last_exception = e
                 
             except requests.exceptions.RequestException as e:
@@ -324,13 +350,145 @@ class CortexAPIClient:
                 if hasattr(last_exception, 'response') and last_exception.response is not None:
                     status_info = f" (HTTP {last_exception.response.status_code})"
                 
-                out.retry(endpoint, status_info, error_type, delay, attempt + 1, self.MAX_RETRIES)
+                out.retry(endpoint_display, status_info, error_type, delay, attempt + 1, self.MAX_RETRIES)
                 time.sleep(delay)
         
-        out.error(f"Failed after {self.MAX_RETRIES} retries: {endpoint}")
+        out.error(f"Failed after {self.MAX_RETRIES} retries: {endpoint_display}")
         if last_exception:
             raise last_exception
-        raise Exception(f"Failed after {self.MAX_RETRIES} retries: {endpoint}")
+        raise Exception(f"Failed after {self.MAX_RETRIES} retries: {endpoint_display}")
+
+
+# =============================================================================
+# XQL DEDUP HELPERS
+# =============================================================================
+
+def execute_xql_query(
+    client: CortexAPIClient,
+    query: str,
+    query_name: str = "XQL Query",
+    *,
+    limit: int = 1000,
+    poll_interval_sec: int = 5,
+    max_wait_sec: int = 300,
+) -> Optional[List[dict]]:
+    """
+    Execute an XQL query using Cortex Cloud XQL runtime APIs.
+    Returns list of rows on SUCCESS, or None on failure.
+    """
+    start_resp = client.post(
+        "/public_api/v1/xql/start_xql_query",
+        {"request_data": {"query": query}},
+        timeout=120,
+    )
+    query_id = start_resp.get("reply") if isinstance(start_resp, dict) else None
+    if not query_id:
+        out.info(f"XQL start failed (no query id) for {query_name} - fail-open")
+        return None
+
+    waited = 0
+    while waited <= max_wait_sec:
+        results_resp = client.post(
+            "/public_api/v1/xql/get_query_results",
+            {
+                "request_data": {
+                    "query_id": query_id,
+                    "pending_flag": True,
+                    "limit": limit,
+                    "format": "json",
+                }
+            },
+            timeout=120,
+        )
+        reply = results_resp.get("reply", {}) if isinstance(results_resp, dict) else {}
+        status = reply.get("status")
+
+        if status == "SUCCESS":
+            results = reply.get("results", {}) if isinstance(reply.get("results", {}), dict) else {}
+            data = results.get("data", []) if isinstance(results, dict) else []
+            return data
+        if status == "FAIL":
+            out.info(f"XQL query failed ({query_name}) - fail-open")
+            return None
+
+        time.sleep(poll_interval_sec)
+        waited += poll_interval_sec
+
+    out.info(f"XQL query timed out ({query_name}) after {max_wait_sec}s - fail-open")
+    return None
+
+
+def check_existing_anchors(
+    client: CortexAPIClient,
+    anchors: List[dict],
+    dataset_name: str,
+    timeframe_days: int,
+) -> Dict[str, int]:
+    """
+    Check which assessment revisions already have data in the Cortex dataset.
+    Returns dict of {revision_str: record_count}.
+    Fail-open: returns {} if the XQL check fails.
+    """
+    if not anchors:
+        return {}
+
+    revisions: List[str] = []
+    for anchor in anchors:
+        rev = anchor.get("assessment_profile_revision")
+        if rev is not None:
+            revisions.append(str(rev))
+
+    unique_revisions = sorted(set(revisions))
+    if not unique_revisions:
+        return {}
+
+    existing: Dict[str, int] = {}
+    chunk_size = 100
+
+    for i in range(0, len(unique_revisions), chunk_size):
+        chunk = unique_revisions[i : i + chunk_size]
+        rev_list = ", ".join(f'"{r}"' for r in chunk)
+
+        query = (
+            f"config timeframe = {timeframe_days}d "
+            f"| dataset = {dataset_name} "
+            f"| filter ASSESSMENT_PROFILE_REVISION in ({rev_list}) "
+            f"| comp count() as record_count by ASSESSMENT_PROFILE_REVISION"
+        )
+
+        out.debug_msg(
+            f"Dedup check: querying {dataset_name} for {len(chunk)} revision(s)"
+        )
+        rows = execute_xql_query(
+            client,
+            query,
+            f"dedup_check_{dataset_name}",
+            limit=1000,
+        )
+
+        if rows is None:
+            out.info(f"Dedup check failed for {dataset_name} - proceeding with push (fail-open)")
+            return {}
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            rev_val = row.get("ASSESSMENT_PROFILE_REVISION")
+            if rev_val is None:
+                rev_val = row.get("assessment_profile_revision")
+            if rev_val is None:
+                continue
+            rev = str(rev_val)
+
+            count_val = row.get("record_count")
+            if count_val is None:
+                count_val = row.get("COUNT")
+            try:
+                existing[rev] = int(count_val)
+            except (TypeError, ValueError):
+                existing[rev] = 0
+
+    return existing
 
 
 # =============================================================================
@@ -557,6 +715,47 @@ def get_all_controls(client: CortexAPIClient, assessments: List[dict], parallel_
 # STAGE 3: FETCH ASSETS
 # =============================================================================
 
+# TEMP DEBUG BLOCK START (remove when Postman validation is done)
+def _dump_get_assets_payload(client: CortexAPIClient, payload: dict, source: str):
+    """
+    TEMP helper to expose exact get_assets payloads for Postman validation.
+    Controlled by env vars in config.env:
+      - DUMP_GET_ASSETS_PAYLOAD=true|false
+      - DUMP_GET_ASSETS_PAYLOAD_FILE=./output/get_assets_payloads.ndjson
+      - DUMP_GET_ASSETS_CURL=true|false
+    """
+    if not getattr(client.config, "DUMP_GET_ASSETS_PAYLOAD", False):
+        return
+
+    snapshot = {
+        "timestamp_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "source": source,
+        "endpoint": "/public_api/v1/compliance/get_assets",
+        "payload": payload,
+    }
+
+    # Always print one-line JSON to terminal for quick copy/paste.
+    out.info(f"[TEMP PAYLOAD] {json.dumps(snapshot, default=str)}")
+
+    if getattr(client.config, "DUMP_GET_ASSETS_CURL", False):
+        curl_cmd = (
+            f"curl -X POST \"{client.base_url}/public_api/v1/compliance/get_assets\" "
+            f"-H \"x-xdr-auth-id: {client.config.API_ID}\" "
+            f"-H \"Authorization: {client.config.API_KEY}\" "
+            f"-H \"Content-Type: application/json\" "
+            f"--data-raw '{json.dumps(payload, default=str)}'"
+        )
+        out.info(f"[TEMP CURL] {curl_cmd}")
+
+    dump_file = getattr(client.config, "DUMP_GET_ASSETS_PAYLOAD_FILE", "")
+    if dump_file:
+        dump_path = Path(dump_file)
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        with _payload_dump_lock:
+            with open(dump_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(snapshot, default=str) + "\n")
+# TEMP DEBUG BLOCK END
+
 def fetch_asset_page(client: CortexAPIClient, anchor: dict, search_from: int, page_size: int) -> Tuple[int, List[dict]]:
     """Fetch a single page of assets."""
     payload = {
@@ -570,9 +769,15 @@ def fetch_asset_page(client: CortexAPIClient, anchor: dict, search_from: int, pa
             "search_to": search_from + page_size
         }
     }
+    # TEMP DEBUG BLOCK: payload visibility for Postman testing
+    _dump_get_assets_payload(client, payload, source=f"fetch_asset_page:{search_from}")
     
     try:
-        response = client.post("/public_api/v1/compliance/get_assets", payload)
+        context = (
+            f"profile={anchor['profile_name']} | standard={anchor['standard_name'][:40]} | "
+            f"range={search_from}-{search_from + page_size}"
+        )
+        response = client.post("/public_api/v1/compliance/get_assets", payload, request_context=context)
         assets = response.get("reply", {}).get("assets", [])
         return (search_from, assets)
     except Exception as e:
@@ -593,8 +798,14 @@ def get_total_asset_count(client: CortexAPIClient, anchor: dict) -> int:
             "search_to": 1
         }
     }
+    # TEMP DEBUG BLOCK: payload visibility for Postman testing
+    _dump_get_assets_payload(client, payload, source="get_total_asset_count")
     
-    response = client.post("/public_api/v1/compliance/get_assets", payload)
+    context = (
+        f"profile={anchor['profile_name']} | standard={anchor['standard_name'][:40]} | "
+        f"range=0-1 (count)"
+    )
+    response = client.post("/public_api/v1/compliance/get_assets", payload, request_context=context)
     return response.get("reply", {}).get("total_count", 0)
 
 
@@ -732,8 +943,14 @@ def fetch_all_assets(
         rows
     )
     
-    est_rate = config.PARALLEL_WORKERS * 2
-    est_minutes = (total_pages_all / est_rate / 60) if est_rate > 0 else 0
+    # Estimate runtime by anchor waves instead of raw request count.
+    # Anchors are processed sequentially; each anchor page fetch runs in waves
+    # of up to PARALLEL_WORKERS concurrent requests.
+    total_waves = sum(
+        math.ceil(ac["pages"] / config.PARALLEL_WORKERS) if ac["pages"] > 0 else 0
+        for ac in anchor_counts
+    ) if config.PARALLEL_WORKERS > 0 else total_pages_all
+    est_minutes = (total_waves * config.EST_API_WAVE_SECONDS) / 60
     out.info(f"Total: [cyan]{total_assets_all:,}[/cyan] assets • [cyan]{total_pages_all:,}[/cyan] API calls • ~[cyan]{est_minutes:.0f}[/cyan] min")
     
     # Fetch assets
@@ -795,6 +1012,37 @@ def save_records_to_ndjson(records: List[dict], output_path: Path) -> int:
         for record in records:
             f.write(json.dumps(record, default=str) + "\n")
     return len(records)
+
+
+def load_records_from_ndjson(input_path: Path, label: str) -> List[dict]:
+    """Load NDJSON records from file with validation."""
+    if not input_path.exists():
+        raise FileNotFoundError(f"{label} file does not exist: {input_path}")
+    if not input_path.is_file():
+        raise ValueError(f"{label} path is not a file: {input_path}")
+
+    records: List[dict] = []
+    with open(input_path, "r", encoding="utf-8") as f:
+        for line_no, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                parsed = json.loads(line)
+            except json.JSONDecodeError as e:
+                raise ValueError(
+                    f"{label} file has invalid JSON at line {line_no}: {e}"
+                ) from e
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    f"{label} file line {line_no} is not a JSON object"
+                )
+            records.append(parsed)
+
+    if not records:
+        raise ValueError(f"{label} file has no valid records: {input_path}")
+
+    return records
 
 
 def print_curl_command(file_path: Path, collector_url: str, api_key_env_var: str):
@@ -1077,7 +1325,113 @@ Examples:
         action="store_true",
         help="Don't push to collector (overrides config)"
     )
+    parser.add_argument(
+        "--force-push",
+        action="store_true",
+        help="Skip dedup checks and push all data even if dataset already contains the revision",
+    )
+    parser.add_argument(
+        "--push-only",
+        action="store_true",
+        help="Skip Cortex fetch pipeline and push existing NDJSON files only",
+    )
+    parser.add_argument(
+        "--assets-file",
+        type=str,
+        help="Path to NDJSON file for assets push (used with --push-only)",
+    )
+    parser.add_argument(
+        "--summaries-file",
+        type=str,
+        help="Path to NDJSON file for summaries push (used with --push-only)",
+    )
     return parser.parse_args()
+
+
+def run_push_only_mode(args, config: Config) -> int:
+    """Push previously generated NDJSON files without fetching from Cortex."""
+    if not args.assets_file and not args.summaries_file:
+        out.error("Push-only mode requires --assets-file and/or --summaries-file")
+        return 1
+
+    out.header("Push-Only Mode")
+    out.info("Skipping Cortex fetch stages and pushing existing NDJSON files")
+
+    elapsed_start = time.time()
+    assets_push = {"pushed": 0, "skipped": True}
+    summaries_push = {"pushed": 0, "skipped": True}
+    assets_count = 0
+    summaries_count = 0
+
+    if args.assets_file:
+        assets_path = Path(args.assets_file).expanduser()
+        try:
+            assets_records = load_records_from_ndjson(assets_path, "Assets")
+        except Exception as e:
+            out.error(str(e))
+            return 1
+
+        assets_count = len(assets_records)
+        out.header("Stage 5: Push Assets to Collector")
+        out.success(f"Loaded: {assets_path} ({assets_count:,} records)")
+        if config.COLLECTOR_URL:
+            print_curl_command(assets_path, config.COLLECTOR_URL, "COMPLIANCE_API_KEY")
+
+        assets_push = push_to_collector(
+            assets_records,
+            config.COLLECTOR_URL,
+            config.COMPLIANCE_API_KEY,
+            config.BATCH_SIZE,
+            config.DRY_RUN,
+            "Asset",
+        )
+        assets_status = "dry run" if assets_push.get("dry_run") else f"{assets_push.get('pushed', 0):,} pushed"
+        out.success(f"Assets: {assets_status}")
+
+    if args.summaries_file:
+        summaries_path = Path(args.summaries_file).expanduser()
+        try:
+            summaries_records = load_records_from_ndjson(summaries_path, "Summaries")
+        except Exception as e:
+            out.error(str(e))
+            return 1
+
+        summaries_count = len(summaries_records)
+        out.header("Stage 7: Push Summaries to Collector")
+        out.success(f"Loaded: {summaries_path} ({summaries_count:,} records)")
+        if config.COLLECTOR_URL:
+            print_curl_command(summaries_path, config.COLLECTOR_URL, "CONTROLS_API_KEY")
+
+        summaries_push = push_to_collector(
+            summaries_records,
+            config.COLLECTOR_URL,
+            config.CONTROLS_API_KEY,
+            config.BATCH_SIZE,
+            config.DRY_RUN,
+            "Summary",
+        )
+        summaries_status = "dry run" if summaries_push.get("dry_run") else f"{summaries_push.get('pushed', 0):,} pushed"
+        out.success(f"Summaries: {summaries_status}")
+
+    def push_status(result):
+        if result.get("skipped"):
+            return "skipped"
+        if result.get("dry_run"):
+            return f"{result.get('pushed', 0):,} (dry run)"
+        return f"{result.get('pushed', 0):,} pushed"
+
+    elapsed = time.time() - elapsed_start
+    stats = {
+        "anchors": 0,
+        "controls": 0,
+        "assets": assets_count,
+        "summaries": summaries_count,
+        "assets_push": push_status(assets_push),
+        "summaries_push": push_status(summaries_push),
+    }
+    out.final_summary(stats, elapsed)
+    out.info(f"Output directory: [cyan]{config.OUTPUT_DIR}[/cyan]")
+    return 0
 
 
 def main():
@@ -1109,6 +1463,9 @@ def main():
     # Load configuration
     dry_run_override = True if args.dry_run else None
     config = Config(dry_run_override=dry_run_override)
+
+    if args.push_only:
+        return run_push_only_mode(args, config)
     
     # Create API client
     client = CortexAPIClient(config)
@@ -1123,7 +1480,31 @@ def main():
     controls_catalog = get_all_controls(client, config.ASSESSMENTS, config.PARALLEL_WORKERS)
     
     # Stage 3: Fetch assets
-    all_assets = fetch_all_assets(client, anchors, controls_catalog, config)
+    anchors_to_fetch_assets = anchors
+    skipped_assets_revisions: Dict[str, int] = {}
+    push_assets_enabled = (not config.DRY_RUN and bool(config.COLLECTOR_URL) and bool(config.COMPLIANCE_API_KEY))
+    if config.DEDUP_ENABLED and push_assets_enabled and (not args.force_push):
+        skipped_assets_revisions = check_existing_anchors(
+            client=client,
+            anchors=anchors,
+            dataset_name=config.ASSETS_DATASET_NAME,
+            timeframe_days=config.DEDUP_TIMEFRAME_DAYS,
+        )
+        if skipped_assets_revisions:
+            anchors_to_fetch_assets = [
+                a for a in anchors
+                if str(a.get("assessment_profile_revision")) not in skipped_assets_revisions
+            ]
+            out.info(
+                f"Dedup: skipping asset fetch for {len(anchors) - len(anchors_to_fetch_assets)} anchor(s) "
+                f"(already present in {config.ASSETS_DATASET_NAME})"
+            )
+    elif args.force_push:
+        out.info("Dedup: force-push=true, skipping dedup checks")
+    elif not push_assets_enabled:
+        out.debug_msg("Dedup (assets): disabled (dry-run or missing collector/key)")
+    
+    all_assets = fetch_all_assets(client, anchors_to_fetch_assets, controls_catalog, config)
     
     # Generate timestamp
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -1136,6 +1517,31 @@ def main():
     
     # Stage 6: Create summaries
     control_summaries = create_control_summary(all_assets, controls_catalog, anchors)
+    summaries_to_push = control_summaries
+
+    # Stage 6b: Dedup summaries before pushing
+    push_summaries_enabled = (not config.DRY_RUN and bool(config.COLLECTOR_URL) and bool(config.CONTROLS_API_KEY))
+    if config.DEDUP_ENABLED and push_summaries_enabled and (not args.force_push):
+        skipped_summary_revisions = check_existing_anchors(
+            client=client,
+            anchors=anchors,
+            dataset_name=config.SUMMARY_DATASET_NAME,
+            timeframe_days=config.DEDUP_TIMEFRAME_DAYS,
+        )
+        if skipped_summary_revisions:
+            summaries_to_push = [
+                r for r in control_summaries
+                if str(r.get("ASSESSMENT_PROFILE_REVISION")) not in skipped_summary_revisions
+            ]
+            out.info(
+                f"Dedup: skipped pushing {len(control_summaries) - len(summaries_to_push):,} summary record(s) "
+                f"(already present in {config.SUMMARY_DATASET_NAME})"
+            )
+    elif args.force_push:
+        # Same message, but for symmetry
+        out.info("Dedup: force-push=true, skipping dedup checks (summaries)")
+    elif not push_summaries_enabled:
+        out.debug_msg("Dedup (summaries): disabled (dry-run or missing collector/key)")
     
     # Save summaries CSV
     if control_summaries:
@@ -1147,7 +1553,7 @@ def main():
         out.debug_msg(f"Saved: {summaries_path.name}")
     
     # Stage 7: Push summaries
-    summaries_push = push_summaries_to_collector(control_summaries, config, timestamp)
+    summaries_push = push_summaries_to_collector(summaries_to_push, config, timestamp)
     
     # Final summary
     elapsed = time.time() - start_time
