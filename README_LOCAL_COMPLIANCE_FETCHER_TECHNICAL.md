@@ -68,6 +68,7 @@ Configuration is loaded from `config.env` next to the script (`dotenv`), then va
 - `DEDUP_TIMEFRAME_DAYS` (default `30`)
 - `ASSETS_DATASET_NAME` (default `panw_compliance_assets_raw`)
 - `SUMMARY_DATASET_NAME` (default `panw_compliance_summary_raw`)
+- `DEDUP_TIMEZONE` (default `UTC`, must be a valid IANA timezone like `America/New_York`)
 
 ## ETA tuning
 
@@ -80,6 +81,9 @@ Configuration is loaded from `config.env` next to the script (`dotenv`), then va
 - `DUMP_GET_ASSETS_PAYLOAD` (`true|false`)
 - `DUMP_GET_ASSETS_PAYLOAD_FILE` (NDJSON path)
 - `DUMP_GET_ASSETS_CURL` (`true|false`)
+- `DUMP_DEDUP_XQL_REQUESTS` (`true|false`)
+- `DUMP_DEDUP_XQL_REQUESTS_FILE` (NDJSON path)
+- `DUMP_DEDUP_XQL_CURL` (`true|false`)
 
 These are temporary diagnostics and are clearly marked in code.
 
@@ -311,7 +315,7 @@ Summary rows include counts, score, control metadata, anchor metadata.
 
 ## 11) Dedup Architecture (Fail-Open)
 
-Dedup is revision-based and checked separately for:
+Dedup is composite-key based and checked separately for:
 
 - assets dataset
 - summaries dataset
@@ -320,12 +324,13 @@ Core function: `check_existing_anchors()`
 
 Flow:
 
-1. Extract unique `assessment_profile_revision` values from anchors.
+1. Extract anchor pairs and bucket by day:
+   - key = `(assessment_profile_revision, calendar_day_in_DEDUP_TIMEZONE)`
 2. Query target dataset through XQL runtime APIs:
    - `start_xql_query`
    - poll with `get_query_results`
 3. Build map:
-   - `{ revision_string: record_count }`
+   - `{ (revision_string, day_start_epoch_ms): record_count }`
 
 Query template:
 
@@ -333,8 +338,15 @@ Query template:
 config timeframe = <N>d
 | dataset = <dataset_name>
 | filter ASSESSMENT_PROFILE_REVISION in ("rev1","rev2",...)
+| filter to_epoch(date_floor(EVALUATION_DATETIME, "d", "<DEDUP_TIMEZONE>"), "millis") = <day_start_epoch_ms>
 | comp count() as record_count by ASSESSMENT_PROFILE_REVISION
 ```
+
+Timezone behavior:
+
+- Python-side day floor and XQL-side day floor both use `DEDUP_TIMEZONE`.
+- `DEDUP_TIMEZONE` is validated at startup via `ZoneInfo(...)`.
+- Invalid timezone values fail fast with a clear configuration error.
 
 Fail-open rules:
 
@@ -362,7 +374,7 @@ Execution points:
 
 ## Idempotency
 
-- Dedup is coarse (revision-level), not per-record hash.
+- Dedup is coarse (revision + calendar-day in `DEDUP_TIMEZONE`), not per-record hash.
 - If fail-open path is triggered, duplicates can be ingested.
 
 ## Error tolerance
@@ -400,8 +412,15 @@ Enable temporary payload dump options in `config.env`:
 - `DUMP_GET_ASSETS_PAYLOAD=true`
 - `DUMP_GET_ASSETS_PAYLOAD_FILE=./output/get_assets_payloads.ndjson`
 - `DUMP_GET_ASSETS_CURL=true`
+- `DUMP_DEDUP_XQL_REQUESTS=true`
+- `DUMP_DEDUP_XQL_REQUESTS_FILE=./output/dedup_xql_requests.ndjson`
+- `DUMP_DEDUP_XQL_CURL=true`
 
-This emits exact payloads and optional curl forms used by the script.
+This emits exact payloads and optional curl forms used by the script. Dedup dump
+captures both request and response events for:
+
+- `/public_api/v1/xql/start_xql_query`
+- `/public_api/v1/xql/get_query_results`
 
 ## Common failure classes
 
@@ -420,5 +439,6 @@ This emits exact payloads and optional curl forms used by the script.
 The script currently includes a clearly marked temporary section:
 
 - `TEMP DEBUG BLOCK` for get-assets payload dump.
+- `TEMP DEBUG BLOCK` for dedup XQL request/response dump.
 
 This block is designed to be removable with minimal impact once troubleshooting is complete.

@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 try:
     import requests
@@ -254,11 +255,15 @@ class Config:
         self.DEDUP_TIMEFRAME_DAYS = int(os.getenv("DEDUP_TIMEFRAME_DAYS", "30"))
         self.ASSETS_DATASET_NAME = os.getenv("ASSETS_DATASET_NAME", "panw_compliance_assets_raw")
         self.SUMMARY_DATASET_NAME = os.getenv("SUMMARY_DATASET_NAME", "panw_compliance_summary_raw")
+        self.DEDUP_TIMEZONE = os.getenv("DEDUP_TIMEZONE", "UTC")
 
         # TEMP DEBUG BLOCK START (remove when Postman validation is done)
         self.DUMP_GET_ASSETS_PAYLOAD = os.getenv("DUMP_GET_ASSETS_PAYLOAD", "false").lower() == "true"
         self.DUMP_GET_ASSETS_PAYLOAD_FILE = os.getenv("DUMP_GET_ASSETS_PAYLOAD_FILE", "")
         self.DUMP_GET_ASSETS_CURL = os.getenv("DUMP_GET_ASSETS_CURL", "false").lower() == "true"
+        self.DUMP_DEDUP_XQL_REQUESTS = os.getenv("DUMP_DEDUP_XQL_REQUESTS", "false").lower() == "true"
+        self.DUMP_DEDUP_XQL_REQUESTS_FILE = os.getenv("DUMP_DEDUP_XQL_REQUESTS_FILE", "")
+        self.DUMP_DEDUP_XQL_CURL = os.getenv("DUMP_DEDUP_XQL_CURL", "false").lower() == "true"
         # TEMP DEBUG BLOCK END
         
         self.validate()
@@ -274,7 +279,15 @@ class Config:
             errors.append("API_ID is required")
         if not self.ASSESSMENTS:
             errors.append("ASSESSMENTS is required (JSON array)")
-        
+
+        try:
+            ZoneInfo(self.DEDUP_TIMEZONE)
+        except (ZoneInfoNotFoundError, ValueError):
+            errors.append(
+                f"DEDUP_TIMEZONE '{self.DEDUP_TIMEZONE}' is not a valid IANA timezone "
+                f"(e.g. UTC, America/New_York)"
+            )
+
         if errors:
             out.error("Configuration errors:")
             for e in errors:
@@ -363,6 +376,55 @@ class CortexAPIClient:
 # XQL DEDUP HELPERS
 # =============================================================================
 
+def _dump_dedup_xql_event(
+    client: CortexAPIClient,
+    event_type: str,
+    endpoint: str,
+    body: dict,
+    source: str,
+    query_name: str,
+):
+    """
+    TEMP helper to expose exact XQL dedup request/response events for troubleshooting.
+    Controlled by env vars in config.env:
+      - DUMP_DEDUP_XQL_REQUESTS=true|false
+      - DUMP_DEDUP_XQL_REQUESTS_FILE=./output/dedup_xql_requests.ndjson
+      - DUMP_DEDUP_XQL_CURL=true|false
+    """
+    if not getattr(client.config, "DUMP_DEDUP_XQL_REQUESTS", False):
+        return
+
+    snapshot = {
+        "timestamp_utc": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "event_type": event_type,
+        "source": source,
+        "query_name": query_name,
+        "endpoint": endpoint,
+        "body": body,
+    }
+
+    # Always print one-line JSON to terminal for quick copy/paste.
+    out.info(f"[TEMP DEDUP XQL] {json.dumps(snapshot, default=str)}")
+
+    if event_type == "request" and getattr(client.config, "DUMP_DEDUP_XQL_CURL", False):
+        curl_cmd = (
+            f"curl -X POST \"{client.base_url}{endpoint}\" "
+            f"-H \"x-xdr-auth-id: {client.config.API_ID}\" "
+            f"-H \"Authorization: {client.config.API_KEY}\" "
+            f"-H \"Content-Type: application/json\" "
+            f"--data-raw '{json.dumps(body, default=str)}'"
+        )
+        out.info(f"[TEMP DEDUP XQL CURL] {curl_cmd}")
+
+    dump_file = getattr(client.config, "DUMP_DEDUP_XQL_REQUESTS_FILE", "")
+    if dump_file:
+        dump_path = Path(dump_file)
+        dump_path.parent.mkdir(parents=True, exist_ok=True)
+        with _payload_dump_lock:
+            with open(dump_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(snapshot, default=str) + "\n")
+
+
 def execute_xql_query(
     client: CortexAPIClient,
     query: str,
@@ -376,10 +438,24 @@ def execute_xql_query(
     Execute an XQL query using Cortex Cloud XQL runtime APIs.
     Returns list of rows on SUCCESS, or None on failure.
     """
-    start_resp = client.post(
-        "/public_api/v1/xql/start_xql_query",
-        {"request_data": {"query": query}},
-        timeout=120,
+    start_endpoint = "/public_api/v1/xql/start_xql_query"
+    start_payload = {"request_data": {"query": query}}
+    _dump_dedup_xql_event(
+        client,
+        "request",
+        start_endpoint,
+        start_payload,
+        source="execute_xql_query:start",
+        query_name=query_name,
+    )
+    start_resp = client.post(start_endpoint, start_payload, timeout=120)
+    _dump_dedup_xql_event(
+        client,
+        "response",
+        start_endpoint,
+        start_resp if isinstance(start_resp, dict) else {"raw_response": str(start_resp)},
+        source="execute_xql_query:start",
+        query_name=query_name,
     )
     query_id = start_resp.get("reply") if isinstance(start_resp, dict) else None
     if not query_id:
@@ -388,17 +464,31 @@ def execute_xql_query(
 
     waited = 0
     while waited <= max_wait_sec:
-        results_resp = client.post(
-            "/public_api/v1/xql/get_query_results",
-            {
-                "request_data": {
-                    "query_id": query_id,
-                    "pending_flag": True,
-                    "limit": limit,
-                    "format": "json",
-                }
-            },
-            timeout=120,
+        results_endpoint = "/public_api/v1/xql/get_query_results"
+        results_payload = {
+            "request_data": {
+                "query_id": query_id,
+                "pending_flag": True,
+                "limit": limit,
+                "format": "json",
+            }
+        }
+        _dump_dedup_xql_event(
+            client,
+            "request",
+            results_endpoint,
+            results_payload,
+            source=f"execute_xql_query:poll waited={waited}s",
+            query_name=query_name,
+        )
+        results_resp = client.post(results_endpoint, results_payload, timeout=120)
+        _dump_dedup_xql_event(
+            client,
+            "response",
+            results_endpoint,
+            results_resp if isinstance(results_resp, dict) else {"raw_response": str(results_resp)},
+            source=f"execute_xql_query:poll waited={waited}s",
+            query_name=query_name,
         )
         reply = results_resp.get("reply", {}) if isinstance(results_resp, dict) else {}
         status = reply.get("status")
@@ -418,75 +508,107 @@ def execute_xql_query(
     return None
 
 
+def _day_floor_ms(ts_ms: int, tz_name: str = "UTC") -> int:
+    """Floor an epoch-millis timestamp to the start of its calendar day in tz_name."""
+    tz = ZoneInfo(tz_name)
+    dt = datetime.fromtimestamp(int(ts_ms) / 1000, tz=tz)
+    day_start = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+    return int(day_start.timestamp() * 1000)
+
+
 def check_existing_anchors(
     client: CortexAPIClient,
     anchors: List[dict],
     dataset_name: str,
     timeframe_days: int,
-) -> Dict[str, int]:
+    tz_name: str = "UTC",
+) -> Dict[Tuple[str, int], int]:
     """
-    Check which assessment revisions already have data in the Cortex dataset.
-    Returns dict of {revision_str: record_count}.
-    Fail-open: returns {} if the XQL check fails.
+    Check which (assessment_profile_revision, eval_day) pairs already have
+    data in the Cortex dataset, where the day boundary is defined by tz_name.
+
+    A row is considered "already present" when the revision was previously
+    pushed within the SAME calendar day in tz_name. Same revision pushed on a
+    different calendar day is treated as new data and will not be marked
+    present.
+
+    Returns dict of {(revision_str, day_start_ms): record_count}.
+    Fail-open: returns {} if any XQL check fails.
     """
     if not anchors:
         return {}
 
-    revisions: List[str] = []
+    # Group anchor revisions by their evaluation day (in tz_name) so we can
+    # issue one XQL per distinct day (typical case is a single day).
+    revs_by_day: Dict[int, set] = {}
     for anchor in anchors:
         rev = anchor.get("assessment_profile_revision")
-        if rev is not None:
-            revisions.append(str(rev))
+        ts = anchor.get("last_evaluation_time")
+        if rev is None or ts is None:
+            continue
+        try:
+            day_ms = _day_floor_ms(int(ts), tz_name)
+        except (TypeError, ValueError):
+            continue
+        revs_by_day.setdefault(day_ms, set()).add(str(rev))
 
-    unique_revisions = sorted(set(revisions))
-    if not unique_revisions:
+    if not revs_by_day:
         return {}
 
-    existing: Dict[str, int] = {}
+    existing: Dict[Tuple[str, int], int] = {}
     chunk_size = 100
+    tz = ZoneInfo(tz_name)
 
-    for i in range(0, len(unique_revisions), chunk_size):
-        chunk = unique_revisions[i : i + chunk_size]
-        rev_list = ", ".join(f'"{r}"' for r in chunk)
+    for day_ms, rev_set in revs_by_day.items():
+        unique_revisions = sorted(rev_set)
+        day_label = datetime.fromtimestamp(day_ms / 1000, tz=tz).strftime("%Y-%m-%d")
 
-        query = (
-            f"config timeframe = {timeframe_days}d "
-            f"| dataset = {dataset_name} "
-            f"| filter ASSESSMENT_PROFILE_REVISION in ({rev_list}) "
-            f"| comp count() as record_count by ASSESSMENT_PROFILE_REVISION"
-        )
+        for i in range(0, len(unique_revisions), chunk_size):
+            chunk = unique_revisions[i : i + chunk_size]
+            rev_list = ", ".join(f'"{r}"' for r in chunk)
 
-        out.debug_msg(
-            f"Dedup check: querying {dataset_name} for {len(chunk)} revision(s)"
-        )
-        rows = execute_xql_query(
-            client,
-            query,
-            f"dedup_check_{dataset_name}",
-            limit=1000,
-        )
+            query = (
+                f"config timeframe = {timeframe_days}d "
+                f"| dataset = {dataset_name} "
+                f"| filter ASSESSMENT_PROFILE_REVISION in ({rev_list}) "
+                f"| filter to_epoch(date_floor(EVALUATION_DATETIME, \"d\", \"{tz_name}\"), \"millis\") = {day_ms} "
+                f"| comp count() as record_count by ASSESSMENT_PROFILE_REVISION"
+            )
 
-        if rows is None:
-            out.info(f"Dedup check failed for {dataset_name} - proceeding with push (fail-open)")
-            return {}
+            out.debug_msg(
+                f"Dedup check: querying {dataset_name} for {len(chunk)} revision(s) "
+                f"at eval_day={day_label} {tz_name} (day_ms={day_ms})"
+            )
+            rows = execute_xql_query(
+                client,
+                query,
+                f"dedup_check_{dataset_name}",
+                limit=1000,
+            )
 
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            rev_val = row.get("ASSESSMENT_PROFILE_REVISION")
-            if rev_val is None:
-                rev_val = row.get("assessment_profile_revision")
-            if rev_val is None:
-                continue
-            rev = str(rev_val)
+            if rows is None:
+                out.info(
+                    f"Dedup check failed for {dataset_name} - proceeding with push (fail-open)"
+                )
+                return {}
 
-            count_val = row.get("record_count")
-            if count_val is None:
-                count_val = row.get("COUNT")
-            try:
-                existing[rev] = int(count_val)
-            except (TypeError, ValueError):
-                existing[rev] = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                rev_val = row.get("ASSESSMENT_PROFILE_REVISION")
+                if rev_val is None:
+                    rev_val = row.get("assessment_profile_revision")
+                if rev_val is None:
+                    continue
+                rev = str(rev_val)
+
+                count_val = row.get("record_count")
+                if count_val is None:
+                    count_val = row.get("COUNT")
+                try:
+                    existing[(rev, day_ms)] = int(count_val)
+                except (TypeError, ValueError):
+                    existing[(rev, day_ms)] = 0
 
     return existing
 
@@ -1481,23 +1603,31 @@ def main():
     
     # Stage 3: Fetch assets
     anchors_to_fetch_assets = anchors
-    skipped_assets_revisions: Dict[str, int] = {}
+    skipped_assets_keys: Dict[Tuple[str, int], int] = {}
     push_assets_enabled = (not config.DRY_RUN and bool(config.COLLECTOR_URL) and bool(config.COMPLIANCE_API_KEY))
     if config.DEDUP_ENABLED and push_assets_enabled and (not args.force_push):
-        skipped_assets_revisions = check_existing_anchors(
+        skipped_assets_keys = check_existing_anchors(
             client=client,
             anchors=anchors,
             dataset_name=config.ASSETS_DATASET_NAME,
             timeframe_days=config.DEDUP_TIMEFRAME_DAYS,
+            tz_name=config.DEDUP_TIMEZONE,
         )
-        if skipped_assets_revisions:
-            anchors_to_fetch_assets = [
-                a for a in anchors
-                if str(a.get("assessment_profile_revision")) not in skipped_assets_revisions
-            ]
+        if skipped_assets_keys:
+            def _anchor_already_pushed(a: dict) -> bool:
+                rev = a.get("assessment_profile_revision")
+                ts = a.get("last_evaluation_time")
+                if rev is None or ts is None:
+                    return False
+                try:
+                    return (str(rev), _day_floor_ms(int(ts), config.DEDUP_TIMEZONE)) in skipped_assets_keys
+                except (TypeError, ValueError):
+                    return False
+
+            anchors_to_fetch_assets = [a for a in anchors if not _anchor_already_pushed(a)]
             out.info(
                 f"Dedup: skipping asset fetch for {len(anchors) - len(anchors_to_fetch_assets)} anchor(s) "
-                f"(already present in {config.ASSETS_DATASET_NAME})"
+                f"(revision+{config.DEDUP_TIMEZONE} eval_day already present in {config.ASSETS_DATASET_NAME})"
             )
     elif args.force_push:
         out.info("Dedup: force-push=true, skipping dedup checks")
@@ -1522,21 +1652,37 @@ def main():
     # Stage 6b: Dedup summaries before pushing
     push_summaries_enabled = (not config.DRY_RUN and bool(config.COLLECTOR_URL) and bool(config.CONTROLS_API_KEY))
     if config.DEDUP_ENABLED and push_summaries_enabled and (not args.force_push):
-        skipped_summary_revisions = check_existing_anchors(
+        skipped_summary_keys = check_existing_anchors(
             client=client,
             anchors=anchors,
             dataset_name=config.SUMMARY_DATASET_NAME,
             timeframe_days=config.DEDUP_TIMEFRAME_DAYS,
+            tz_name=config.DEDUP_TIMEZONE,
         )
-        if skipped_summary_revisions:
-            summaries_to_push = [
-                r for r in control_summaries
-                if str(r.get("ASSESSMENT_PROFILE_REVISION")) not in skipped_summary_revisions
-            ]
-            out.info(
-                f"Dedup: skipped pushing {len(control_summaries) - len(summaries_to_push):,} summary record(s) "
-                f"(already present in {config.SUMMARY_DATASET_NAME})"
-            )
+        if skipped_summary_keys:
+            # Each anchor in this run carries one revision; map composite hits
+            # back to the set of revisions to drop from this run's summaries.
+            skipped_summary_revisions = set()
+            for a in anchors:
+                rev = a.get("assessment_profile_revision")
+                ts = a.get("last_evaluation_time")
+                if rev is None or ts is None:
+                    continue
+                try:
+                    if (str(rev), _day_floor_ms(int(ts), config.DEDUP_TIMEZONE)) in skipped_summary_keys:
+                        skipped_summary_revisions.add(str(rev))
+                except (TypeError, ValueError):
+                    continue
+
+            if skipped_summary_revisions:
+                summaries_to_push = [
+                    r for r in control_summaries
+                    if str(r.get("ASSESSMENT_PROFILE_REVISION")) not in skipped_summary_revisions
+                ]
+                out.info(
+                    f"Dedup: skipped pushing {len(control_summaries) - len(summaries_to_push):,} summary record(s) "
+                    f"(revision+{config.DEDUP_TIMEZONE} eval_day already present in {config.SUMMARY_DATASET_NAME})"
+                )
     elif args.force_push:
         # Same message, but for symmetry
         out.info("Dedup: force-push=true, skipping dedup checks (summaries)")
